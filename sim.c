@@ -1,5 +1,6 @@
 // Jos Stam–style 'Stable Fluids' solver in double precision
-// gcc -O3 -march=native -ffast-math -funroll-loops sim.c -lncursesw -lm -o sim && ./sim
+// gcc -O3 -march=native -ffast-math -funroll-loops sim.c -lncursesw -lm -o sim
+// && ./sim
 
 #define _GNU_SOURCE
 
@@ -12,11 +13,11 @@
 
 #include <ncursesw/curses.h>
 
-#define N 512                   // grid resolution
-#define DT 1                    // time-step (τ)
-#define VISC 1e-6               // viscosity
-#define DIFF 1e-7               // density diffusion
-#define DENS_DECAY (1-1e-6)     // global exponential fade
+#define N 512                 // grid resolution
+#define DT 1                  // time-step (τ)
+#define VISC 1e-6             // viscosity
+#define DIFF 1e-7             // density diffusion
+#define DENS_DECAY (1 - 1e-6) // global exponential fade
 
 #define X0 1.0
 #define Y0 1.0
