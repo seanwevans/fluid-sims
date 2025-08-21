@@ -27,7 +27,6 @@
 
 #define IX(i, j) ((i) + (N + 2) * (j))
 
-// ---- CUDA error check macro ----
 #define CUDA_CHECK(ans)                                                        \
   { gpuAssert((ans), __FILE__, __LINE__); }
 inline void gpuAssert(cudaError_t code, const char *file, int line) {
@@ -37,7 +36,6 @@ inline void gpuAssert(cudaError_t code, const char *file, int line) {
     exit(code);
   }
 }
-// --------------------------------
 
 static bool curses_active = false;
 double *d_u, *d_v, *d_u0, *d_v0, *d_d, *d_d0, *d_dx, *d_dy, *d_tmp;
