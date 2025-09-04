@@ -1,8 +1,8 @@
 Video: A CUDA-based 3D fluid dynamics simulator
 
-https://github.com/user-attachments/assets/c80b3505-f605-4a49-815f-2f64e1824464
-
 https://github.com/user-attachments/assets/b6ebef66-554e-477c-8204-cc5b7d855403
+
+https://github.com/user-attachments/assets/c80b3505-f605-4a49-815f-2f64e1824464
 
 Video: 2-D CUDA-accelerated SPH fluid simulator
 
