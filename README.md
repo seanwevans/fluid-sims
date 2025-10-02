@@ -19,3 +19,5 @@ https://github.com/user-attachments/assets/2d664af1-662b-49a4-9d7e-dda5710ed6e2
 Video: A CUDA-based 2-D fluid dynamics simulator
 
 https://github.com/user-attachments/assets/b7bbda96-7fec-4abb-9a80-bc461a0edaa6
+
+Video: CUDA Gray-Scott reaction-diffusion simulator (build `tau_gray_scott`)
