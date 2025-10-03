@@ -1,20 +1,13 @@
 // tau_gray_scott.cu — CUDA Gray-Scott reaction-diffusion simulator with ncurses
 //
 // Build:
-//   nvcc -std=c++17 -O3 -use_fast_math -arch=sm_86 -lineinfo -o tau_gray_scott \
-//        tau_gray_scott.cu -lncursesw
+//   nvcc -std=c++17 -ccbin g++-10 -O3 -use_fast_math -arch=sm_86 -lineinfo tau_gray_scott.cu -lncursesw -o tgs
 //
 // Run:
-//   ./tau_gray_scott --nx 256 --ny 256 --Du 0.2 --Dv 0.1 --F 0.0367 --k 0.0649 \
-//       --dt 1.0 --stride 4 --fps 30
-//   ./tau_gray_scott --headless --steps 10000
+//   ./tgs                         # auto-fills screen
+//   ./tgs --halfblocks            # auto-fill with double vertical resolution
+//   ./tgs --nx 200 --ny 200       # override with custom size
 //
-// The simulation integrates the Gray-Scott reaction-diffusion equations on a
-// periodic 2-D domain:
-//   du/dt = Du ∇²u - uv² + F (1 - u)
-//   dv/dt = Dv ∇²v + uv² - (F + k) v
-// using an explicit five-point Laplacian. Rendering is handled via ncurses using
-// a simple ASCII ramp based on the inhibitor (v) concentration.
 
 #include <algorithm>
 #include <chrono>
@@ -33,7 +26,7 @@
 
 static bool curses_active = false;
 
-#define CUDA_CHECK(ans)                                                         \
+#define CUDA_CHECK(ans) \
   { gpuAssert((ans), __FILE__, __LINE__); }
 inline void gpuAssert(cudaError_t code, const char *file, int line) {
   if (code != cudaSuccess) {
@@ -48,27 +41,29 @@ inline void gpuAssert(cudaError_t code, const char *file, int line) {
 }
 
 struct Params {
-  int nx = 256;
-  int ny = 256;
+  int nx = 0;
+  int ny = 0;
   float dx = 1.0f;
   float dt = 1.0f;
 
   float Du = 0.2f;
   float Dv = 0.1f;
-  float feed = 0.0367f;
-  float kill = 0.0649f;
+  float feed = 0.03f;
+  float kill = 0.06f;
 
   int steps = 0; // 0 = run forever
   bool headless = false;
   int stride = 4;
-  int fps_limit = 30;
+  int fps_limit = 0;
   unsigned seed = 1337;
+
+  bool halfblocks = false;
 };
 
 void usage(const char *prog) {
   printf("Usage: %s [options]\n", prog);
-  puts("  --nx N        grid cells in x (256)");
-  puts("  --ny N        grid cells in y (256)");
+  puts("  --nx N        grid cells in x (auto = screen width)");
+  puts("  --ny N        grid cells in y (auto = screen height)");
   puts("  --dx DX       cell size (1)");
   puts("  --dt DT       time step (1)");
   puts("  --Du D        diffusion coefficient for U (0.2)");
@@ -78,8 +73,9 @@ void usage(const char *prog) {
   puts("  --steps K     number of steps (0 = infinite)");
   puts("  --headless    disable ncurses rendering");
   puts("  --stride N    render every N steps (4)");
-  puts("  --fps N       cap display FPS (30, 0 = uncapped)");
+  puts("  --fps N       cap display FPS (0 = uncapped)");
   puts("  --seed S      RNG seed for initial pattern (1337)");
+  puts("  --halfblocks  render using half-blocks (double vertical resolution)");
   puts("  -h, --help    show this help message");
 }
 
@@ -91,7 +87,8 @@ void parse_args(int argc, char **argv, Params &P) {
       {"F", required_argument, 0, 0},      {"k", required_argument, 0, 0},
       {"steps", required_argument, 0, 0},  {"headless", no_argument, 0, 0},
       {"stride", required_argument, 0, 0}, {"fps", required_argument, 0, 0},
-      {"seed", required_argument, 0, 0},   {"help", no_argument, 0, 'h'},
+      {"seed", required_argument, 0, 0},   {"halfblocks", no_argument, 0, 0},
+      {"help", no_argument, 0, 'h'},
       {0, 0, 0, 0}};
 
   while (1) {
@@ -132,6 +129,8 @@ void parse_args(int argc, char **argv, Params &P) {
       P.fps_limit = atoi(optarg);
     else if (strcmp(opt, "seed") == 0)
       P.seed = static_cast<unsigned>(strtoul(optarg, nullptr, 10));
+    else if (strcmp(opt, "halfblocks") == 0)
+      P.halfblocks = true;
   }
 }
 
@@ -188,7 +187,6 @@ void init_pattern(std::vector<float> &u, std::vector<float> &v, int nx, int ny,
     }
   }
 
-  // sprinkle random seeds for variety
   uint32_t state = seed ? seed : 1u;
   auto rng = [&]() {
     state ^= state << 13;
@@ -205,37 +203,66 @@ void init_pattern(std::vector<float> &u, std::vector<float> &v, int nx, int ny,
   }
 }
 
-void render_field(const float *v_field, int nx, int ny, int step, const Params &P,
-                  float elapsed_ms) {
-  static const char ramp[] = " .:-=+*#%@";
-  const int ramp_len = sizeof(ramp) - 1;
+void render_field(const float *v_field, int nx, int ny, int step,
+                  const Params &P, float elapsed_ms) {
+  if (P.halfblocks) {
+    int rows = std::min(ny / 2, LINES - 2);
+    int cols = std::min(nx, COLS);
 
-  int rows = std::min(ny, LINES - 2);
-  int cols = std::min(nx, COLS);
+    float vmin = 1e9f, vmax = -1e9f;
+    for (int j = 0; j < ny; ++j)
+      for (int i = 0; i < nx; ++i) {
+        float v = v_field[j * nx + i];
+        vmin = std::min(vmin, v);
+        vmax = std::max(vmax, v);
+      }
+    float inv = (vmax > vmin) ? 1.0f / (vmax - vmin) : 1.0f;
 
-  float vmin = 1e9f, vmax = -1e9f;
-  for (int j = 0; j < ny; ++j)
-    for (int i = 0; i < nx; ++i) {
-      float v = v_field[j * nx + i];
-      vmin = std::min(vmin, v);
-      vmax = std::max(vmax, v);
+    for (int j = 0; j < rows; ++j) {
+      for (int i = 0; i < cols; ++i) {
+        float top = (v_field[(2 * j) * nx + i] - vmin) * inv;
+        float bot = (v_field[(2 * j + 1) * nx + i] - vmin) * inv;
+        int top_on = (top > 0.5f);
+        int bot_on = (bot > 0.5f);
+
+        const wchar_t *ch = L" ";
+        if (top_on && bot_on) ch = L"█";
+        else if (top_on)      ch = L"▀";
+        else if (bot_on)      ch = L"▄";
+
+        mvaddwstr(j, i, ch);
+      }
     }
-  float inv = (vmax > vmin) ? 1.0f / (vmax - vmin) : 1.0f;
+  } else {
+    static const wchar_t* ramp[] = {L" ", L"░", L"▒", L"▓", L"█"};
+    const int ramp_len = sizeof(ramp) / sizeof(ramp[0]);
 
-  for (int j = 0; j < rows; ++j) {
-    for (int i = 0; i < cols; ++i) {
-      float v = v_field[j * nx + i];
-      float t = (v - vmin) * inv;
-      int idx = std::clamp(int(t * ramp_len), 0, ramp_len - 1);
-      mvaddch(j, i, ramp[idx]);
+    int rows = std::min(ny, LINES - 2);
+    int cols = std::min(nx, COLS);
+
+    float vmin = 1e9f, vmax = -1e9f;
+    for (int j = 0; j < ny; ++j)
+      for (int i = 0; i < nx; ++i) {
+        float v = v_field[j * nx + i];
+        vmin = std::min(vmin, v);
+        vmax = std::max(vmax, v);
+      }
+    float inv = (vmax > vmin) ? 1.0f / (vmax - vmin) : 1.0f;
+
+    for (int j = 0; j < rows; ++j) {
+      for (int i = 0; i < cols; ++i) {
+        float v = v_field[j * nx + i];
+        float t = (v - vmin) * inv;
+        int idx = std::clamp(int(t * ramp_len), 0, ramp_len - 1);
+        mvaddwstr(j, i, ramp[idx]);
+      }
     }
   }
-  for (int j = rows; j < LINES - 1; ++j)
-    mvhline(j, 0, ' ', COLS);
 
   mvprintw(LINES - 1, 0,
-           "step=%d dt=%.3f F=%.4f k=%.4f Du=%.3f Dv=%.3f frame=%.2fms",
-           step, P.dt, P.feed, P.kill, P.Du, P.Dv, elapsed_ms);
+           "step=%d dt=%.3f F=%.4f k=%.4f Du=%.3f Dv=%.3f frame=%.2fms %s",
+           step, P.dt, P.feed, P.kill, P.Du, P.Dv, elapsed_ms,
+           P.halfblocks ? "[halfblocks]" : "");
   refresh();
 }
 
@@ -243,9 +270,29 @@ int main(int argc, char **argv) {
   setlocale(LC_ALL, "");
   Params P;
   parse_args(argc, argv, P);
-  if (P.nx <= 0 || P.ny <= 0) {
-    fprintf(stderr, "Grid dimensions must be positive\n");
-    return EXIT_FAILURE;
+
+  // Initialize curses first if not headless, so we know screen size
+  float *h_v_pinned = nullptr;
+  if (!P.headless) {
+    initscr();
+    curses_active = true;
+    noecho();
+    curs_set(0);
+    nodelay(stdscr, TRUE);
+
+    int scr_rows, scr_cols;
+    getmaxyx(stdscr, scr_rows, scr_cols);
+
+    if (P.nx == 0) P.nx = scr_cols;
+    if (P.ny == 0) {
+      if (P.halfblocks)
+        P.ny = (scr_rows - 1) * 2; // double resolution
+      else
+        P.ny = scr_rows - 1;
+    }
+  } else {
+    if (P.nx == 0) P.nx = 128;
+    if (P.ny == 0) P.ny = 128;
   }
 
   size_t N = static_cast<size_t>(P.nx) * static_cast<size_t>(P.ny);
@@ -258,19 +305,11 @@ int main(int argc, char **argv) {
   CUDA_CHECK(cudaMalloc(&d_v0, N * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_v1, N * sizeof(float)));
 
-  CUDA_CHECK(cudaMemcpy(d_u0, h_u.data(), N * sizeof(float),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_v0, h_v.data(), N * sizeof(float),
-                        cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_u0, h_u.data(), N * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_v0, h_v.data(), N * sizeof(float), cudaMemcpyHostToDevice));
 
-  float *h_v_pinned = nullptr;
   if (!P.headless) {
     CUDA_CHECK(cudaHostAlloc(&h_v_pinned, N * sizeof(float), cudaHostAllocDefault));
-    initscr();
-    curses_active = true;
-    noecho();
-    curs_set(0);
-    nodelay(stdscr, TRUE);
   }
 
   dim3 block(16, 16);
@@ -281,8 +320,8 @@ int main(int argc, char **argv) {
   bool running = true;
   while (running && (P.steps == 0 || step < P.steps)) {
     auto frame_start = std::chrono::steady_clock::now();
-    step_kernel<<<grid, block>>>(d_u1, d_v1, d_u0, d_v0, P.nx, P.ny, P.Du,
-                                 P.Dv, P.dt, P.dx, P.feed, P.kill);
+    step_kernel<<<grid, block>>>(d_u1, d_v1, d_u0, d_v0, P.nx, P.ny,
+                                 P.Du, P.Dv, P.dt, P.dx, P.feed, P.kill);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     std::swap(d_u0, d_u1);
@@ -290,8 +329,7 @@ int main(int argc, char **argv) {
     ++step;
 
     if (!P.headless && (step % P.stride == 0)) {
-      CUDA_CHECK(cudaMemcpy(h_v_pinned, d_v0, N * sizeof(float),
-                            cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(h_v_pinned, d_v0, N * sizeof(float), cudaMemcpyDeviceToHost));
       auto now = std::chrono::steady_clock::now();
       float ms = std::chrono::duration<float, std::milli>(now - frame_start).count();
       render_field(h_v_pinned, P.nx, P.ny, step, P, ms);
