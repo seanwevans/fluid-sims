@@ -1,9 +1,18 @@
 // tau_hypersonic_cuda.cu
-// Linux build (raylib installed system-wide):
-//   nvcc -O3 -std=c++17 -Xcompiler "-O3" tau_hypersonic_cuda.cu \
-//        -lraylib -lm -lX11 -o tau_2d_cuda
 //
-// SPACE pause, R reset, M mode
+//   nvcc -O3 -std=c++17 -arch=sm_86 tau_hypersonic_cuda_visc.cu \
+//     -lraylib -lm -lpthread -ldl -lrt -lX11 -o tau_2d_cuda
+//
+// Controls: SPACE pause, R reset, M mode
+//
+// View modes (M cycles):
+//   0 log(rho)
+//   1 log(p)
+//   2 speed
+//   3 schlieren (|∇rho|)
+//   4 vorticity (asinh(omega))
+//   5 Mach
+//   6 log(p/rho)
 
 #include "raylib.h"
 #include <cuda_runtime.h>
@@ -13,17 +22,29 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define W 300
-#define H 300
-#define SCALE 2
+#define W 1600
+#define H 720
+#define SCALE 1
 
 #define GAMMA 1.4
-#define CFL 0.3
+#define CFL 0.275
 
 #define STEPS_PER_FRAME 2
 
 #define EPS_RHO 1e-10
 #define EPS_P 1e-10
+
+#ifndef VISC_NU
+#define VISC_NU 0.002
+#endif
+
+#ifndef VISC_RHO
+#define VISC_RHO 0.0005 // density diffusion
+#endif
+
+#ifndef VISC_E
+#define VISC_E 0.002 // energy diffusion
+#endif
 
 static inline void ck(cudaError_t e, const char *msg) {
   if (e != cudaSuccess) {
@@ -66,9 +87,11 @@ __device__ __forceinline__ Prim cons_to_prim(Cons c) {
   double inv = 1.0 / rho;
   double u = c.mx * inv;
   double v = c.my * inv;
+
   double kin = 0.5 * rho * (u * u + v * v);
   double eint = c.E - kin;
   double pr = (GAMMA - 1.0) * d_fmax(eint, EPS_P);
+
   p.rho = rho;
   p.u = u;
   p.v = v;
@@ -80,6 +103,7 @@ __device__ __forceinline__ Cons prim_to_cons(Prim p) {
   Cons c;
   double rho = d_fmax(p.rho, EPS_RHO);
   double pr = d_fmax(p.p, EPS_P);
+
   c.rho = rho;
   c.mx = rho * p.u;
   c.my = rho * p.v;
@@ -130,8 +154,7 @@ __device__ __forceinline__ Prim inflow_state() {
   const double p = 1.0;
   double a = sqrt(GAMMA * p / rho);
   double u = mach * a;
-  Prim s{rho, u, 0.0, p};
-  return s;
+  return Prim{rho, u, 0.0, p};
 }
 
 __device__ __forceinline__ Cons load_cons(const Usoa U, int i) {
@@ -145,22 +168,15 @@ __device__ __forceinline__ void store_cons(Usoa U, int i, Cons c) {
   U.E[i] = c.E;
 }
 
-__device__ __forceinline__ Cons reflect_slip(Cons inside, double nx,
-                                             double ny) {
+__device__ __forceinline__ Cons reflect_noslip(Cons inside) {
   Prim p = cons_to_prim(inside);
-  double vn = p.u * nx + p.v * ny;
-  double ut = -p.u * ny + p.v * nx;
-  vn = -vn;
-  double u = vn * nx - ut * ny;
-  double v = vn * ny + ut * nx;
-  Prim g{p.rho, u, v, p.p};
+  Prim g{p.rho, -p.u, -p.v, p.p};
   return prim_to_cons(g);
 }
 
 __device__ __forceinline__ Cons neighbor_or_wall(const Usoa U,
                                                  const uint8_t *mask, int x,
-                                                 int y, int dx, int dy,
-                                                 double nx, double ny) {
+                                                 int y, int dx, int dy) {
   int xn = x + dx;
   int yn = y + dy;
 
@@ -169,20 +185,38 @@ __device__ __forceinline__ Cons neighbor_or_wall(const Usoa U,
   if (yn >= H)
     yn = H - 1;
 
-  // left inflow
   if (xn < 0) {
     return prim_to_cons(inflow_state());
   }
-  // right outflow
   if (xn >= W) {
-    int i = d_idx(W - 1, yn);
-    return load_cons(U, i);
+    return load_cons(U, d_idx(W - 1, yn));
   }
 
   int j = d_idx(xn, yn);
   if (mask[j]) {
-    int i = d_idx(x, y);
-    return reflect_slip(load_cons(U, i), nx, ny);
+    return reflect_noslip(load_cons(U, d_idx(x, y)));
+  }
+  return load_cons(U, j);
+}
+
+__device__ __forceinline__ Cons neighbor_for_diff(const Usoa U,
+                                                  const uint8_t *mask, int xc,
+                                                  int yc, int xn, int yn) {
+  if (yn < 0)
+    yn = 0;
+  if (yn >= H)
+    yn = H - 1;
+
+  if (xn < 0) {
+    return prim_to_cons(inflow_state());
+  }
+  if (xn >= W) {
+    return load_cons(U, d_idx(W - 1, yn));
+  }
+
+  int j = d_idx(xn, yn);
+  if (mask[j]) {
+    return reflect_noslip(load_cons(U, d_idx(xc, yc)));
   }
   return load_cons(U, j);
 }
@@ -221,10 +255,9 @@ __device__ __forceinline__ void enforce_positive_faces(Prim &qm, const Prim &qc,
 __device__ __forceinline__ FacePrim reconstruct_x(const Usoa U,
                                                   const uint8_t *mask, int x,
                                                   int y) {
-  int ic = d_idx(x, y);
-  Cons Uc = load_cons(U, ic);
-  Cons Um = neighbor_or_wall(U, mask, x, y, -1, 0, 1, 0);
-  Cons Up = neighbor_or_wall(U, mask, x, y, +1, 0, 1, 0);
+  Cons Uc = load_cons(U, d_idx(x, y));
+  Cons Um = neighbor_or_wall(U, mask, x, y, -1, 0);
+  Cons Up = neighbor_or_wall(U, mask, x, y, +1, 0);
 
   Prim qm = cons_to_prim(Um);
   Prim qc = cons_to_prim(Uc);
@@ -258,10 +291,9 @@ __device__ __forceinline__ FacePrim reconstruct_x(const Usoa U,
 __device__ __forceinline__ FacePrim reconstruct_y(const Usoa U,
                                                   const uint8_t *mask, int x,
                                                   int y) {
-  int ic = d_idx(x, y);
-  Cons Uc = load_cons(U, ic);
-  Cons Um = neighbor_or_wall(U, mask, x, y, 0, -1, 0, 1);
-  Cons Up = neighbor_or_wall(U, mask, x, y, 0, +1, 0, 1);
+  Cons Uc = load_cons(U, d_idx(x, y));
+  Cons Um = neighbor_or_wall(U, mask, x, y, 0, -1);
+  Cons Up = neighbor_or_wall(U, mask, x, y, 0, +1);
 
   Prim qm = cons_to_prim(Um);
   Prim qc = cons_to_prim(Uc);
@@ -462,8 +494,7 @@ __global__ void k_init(Usoa U, uint8_t *mask) {
 
   Prim inflow = inflow_state();
   Prim s = m ? Prim{inflow.rho, 0.0, 0.0, inflow.p} : inflow;
-  Cons c = prim_to_cons(s);
-  store_cons(U, i, c);
+  store_cons(U, i, prim_to_cons(s));
 }
 
 __global__ void k_apply_inflow_left(Usoa U, const uint8_t *mask) {
@@ -485,8 +516,7 @@ __global__ void k_max_wavespeed(const Usoa U, const uint8_t *mask,
 
   double v = 1e-12;
   if (i < N && !mask[i]) {
-    Cons c = load_cons(U, i);
-    Prim p = cons_to_prim(c);
+    Prim p = cons_to_prim(load_cons(U, i));
     double a = sound_speed(p);
     double sx = d_fabs(p.u) + a;
     double sy = d_fabs(p.v) + a;
@@ -507,47 +537,43 @@ __global__ void k_max_wavespeed(const Usoa U, const uint8_t *mask,
     blockMax[blockIdx.x] = smax[0];
 }
 
-// Unew = U - dt/dx*(FxR-FxL) - dt/dy*(GyT-GyB)
-__global__ void k_step(Usoa U, Usoa Unew, const uint8_t *mask, double dt_dx,
-                       double dt_dy, double half_dt_dx, double half_dt_dy) {
+// hyperbolic Euler step + tiny Laplacian diffusion
+__global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
+                       double dt_dx, double dt_dy, double half_dt_dx,
+                       double half_dt_dy) {
   int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
   int N = W * H;
   if (i >= N)
     return;
-  if (mask[i]) { // keep as-is (solid)
-    store_cons(Unew, i, load_cons(U, i));
+
+  if (mask[i]) {
+    store_cons(Uout, i, load_cons(U, i));
     return;
   }
 
   int x = i % W;
   int y = i / W;
 
+  // X faces
   Prim qL_left, qR_left;
   {
     if (x - 1 >= 0 && !mask[d_idx(x - 1, y)]) {
       FacePrim fp = reconstruct_x(U, mask, x - 1, y);
-      qL_left = fp.R;
       Cons FLf = flux_x(prim_to_cons(fp.R));
       Cons FLb = flux_x(prim_to_cons(fp.L));
       qL_left =
           half_step_predict_x(fp.R, (FLf.rho - FLb.rho), (FLf.mx - FLb.mx),
                               (FLf.my - FLb.my), (FLf.E - FLb.E), half_dt_dx);
     } else {
-      Cons ULc = neighbor_or_wall(U, mask, x, y, -1, 0, 1, 0);
-      qL_left = cons_to_prim(ULc);
+      qL_left = cons_to_prim(neighbor_or_wall(U, mask, x, y, -1, 0));
     }
 
-    if (!mask[d_idx(x, y)]) {
-      FacePrim fp = reconstruct_x(U, mask, x, y);
-      qR_left = fp.L;
-      Cons FRf = flux_x(prim_to_cons(fp.R));
-      Cons FRb = flux_x(prim_to_cons(fp.L));
-      qR_left =
-          half_step_predict_x(fp.L, (FRf.rho - FRb.rho), (FRf.mx - FRb.mx),
-                              (FRf.my - FRb.my), (FRf.E - FRb.E), half_dt_dx);
-    } else {
-      qR_left = cons_to_prim(load_cons(U, i));
-    }
+    FacePrim fpC = reconstruct_x(U, mask, x, y);
+    Cons FRf = flux_x(prim_to_cons(fpC.R));
+    Cons FRb = flux_x(prim_to_cons(fpC.L));
+    qR_left =
+        half_step_predict_x(fpC.L, (FRf.rho - FRb.rho), (FRf.mx - FRb.mx),
+                            (FRf.my - FRb.my), (FRf.E - FRb.E), half_dt_dx);
 
     qL_left.rho = d_fmax(qL_left.rho, EPS_RHO);
     qL_left.p = d_fmax(qL_left.p, EPS_P);
@@ -557,27 +583,22 @@ __global__ void k_step(Usoa U, Usoa Unew, const uint8_t *mask, double dt_dx,
 
   Prim qL_right, qR_right;
   {
-    // this cell right face
     FacePrim fpC = reconstruct_x(U, mask, x, y);
-    qL_right = fpC.R;
     Cons CFf = flux_x(prim_to_cons(fpC.R));
     Cons CFb = flux_x(prim_to_cons(fpC.L));
     qL_right =
         half_step_predict_x(fpC.R, (CFf.rho - CFb.rho), (CFf.mx - CFb.mx),
                             (CFf.my - CFb.my), (CFf.E - CFb.E), half_dt_dx);
 
-    // right neighbor left face
     if (x + 1 < W && !mask[d_idx(x + 1, y)]) {
       FacePrim fpN = reconstruct_x(U, mask, x + 1, y);
-      qR_right = fpN.L;
       Cons NFf = flux_x(prim_to_cons(fpN.R));
       Cons NFb = flux_x(prim_to_cons(fpN.L));
       qR_right =
           half_step_predict_x(fpN.L, (NFf.rho - NFb.rho), (NFf.mx - NFb.mx),
                               (NFf.my - NFb.my), (NFf.E - NFb.E), half_dt_dx);
     } else {
-      Cons URc = neighbor_or_wall(U, mask, x, y, +1, 0, 1, 0);
-      qR_right = cons_to_prim(URc);
+      qR_right = cons_to_prim(neighbor_or_wall(U, mask, x, y, +1, 0));
     }
 
     qL_right.rho = d_fmax(qL_right.rho, EPS_RHO);
@@ -589,23 +610,21 @@ __global__ void k_step(Usoa U, Usoa Unew, const uint8_t *mask, double dt_dx,
   Cons FxL = hllc_x(prim_to_cons(qL_left), prim_to_cons(qR_left));
   Cons FxR = hllc_x(prim_to_cons(qL_right), prim_to_cons(qR_right));
 
+  // Y
   Prim qB_bot, qT_bot;
   {
     if (y - 1 >= 0 && !mask[d_idx(x, y - 1)]) {
       FacePrim fp = reconstruct_y(U, mask, x, y - 1);
-      qB_bot = fp.R;
       Cons GBf = flux_y(prim_to_cons(fp.R));
       Cons GBb = flux_y(prim_to_cons(fp.L));
       qB_bot =
           half_step_predict_y(fp.R, (GBf.rho - GBb.rho), (GBf.mx - GBb.mx),
                               (GBf.my - GBb.my), (GBf.E - GBb.E), half_dt_dy);
     } else {
-      Cons UBc = neighbor_or_wall(U, mask, x, y, 0, -1, 0, 1);
-      qB_bot = cons_to_prim(UBc);
+      qB_bot = cons_to_prim(neighbor_or_wall(U, mask, x, y, 0, -1));
     }
 
     FacePrim fpC = reconstruct_y(U, mask, x, y);
-    qT_bot = fpC.L;
     Cons GTf = flux_y(prim_to_cons(fpC.R));
     Cons GTb = flux_y(prim_to_cons(fpC.L));
     qT_bot =
@@ -621,7 +640,6 @@ __global__ void k_step(Usoa U, Usoa Unew, const uint8_t *mask, double dt_dx,
   Prim qB_top, qT_top;
   {
     FacePrim fpC = reconstruct_y(U, mask, x, y);
-    qB_top = fpC.R;
     Cons CFf = flux_y(prim_to_cons(fpC.R));
     Cons CFb = flux_y(prim_to_cons(fpC.L));
     qB_top =
@@ -630,15 +648,13 @@ __global__ void k_step(Usoa U, Usoa Unew, const uint8_t *mask, double dt_dx,
 
     if (y + 1 < H && !mask[d_idx(x, y + 1)]) {
       FacePrim fpN = reconstruct_y(U, mask, x, y + 1);
-      qT_top = fpN.L;
       Cons NFf = flux_y(prim_to_cons(fpN.R));
       Cons NFb = flux_y(prim_to_cons(fpN.L));
       qT_top =
           half_step_predict_y(fpN.L, (NFf.rho - NFb.rho), (NFf.mx - NFb.mx),
                               (NFf.my - NFb.my), (NFf.E - NFb.E), half_dt_dy);
     } else {
-      Cons UTc = neighbor_or_wall(U, mask, x, y, 0, +1, 0, 1);
-      qT_top = cons_to_prim(UTc);
+      qT_top = cons_to_prim(neighbor_or_wall(U, mask, x, y, 0, +1));
     }
 
     qB_top.rho = d_fmax(qB_top.rho, EPS_RHO);
@@ -650,9 +666,10 @@ __global__ void k_step(Usoa U, Usoa Unew, const uint8_t *mask, double dt_dx,
   Cons GyB = hllc_y(prim_to_cons(qB_bot), prim_to_cons(qT_bot));
   Cons GyT = hllc_y(prim_to_cons(qB_top), prim_to_cons(qT_top));
 
-  // Update
+  // Hyperbolic update
   Cons Uc = load_cons(U, i);
   Cons Un = Uc;
+
   Un.rho -= dt_dx * (FxR.rho - FxL.rho);
   Un.mx -= dt_dx * (FxR.mx - FxL.mx);
   Un.my -= dt_dx * (FxR.my - FxL.my);
@@ -663,7 +680,23 @@ __global__ void k_step(Usoa U, Usoa Unew, const uint8_t *mask, double dt_dx,
   Un.my -= dt_dy * (GyT.my - GyB.my);
   Un.E -= dt_dy * (GyT.E - GyB.E);
 
-  // positivity
+  {
+    Cons UL = neighbor_for_diff(U, mask, x, y, x - 1, y);
+    Cons UR = neighbor_for_diff(U, mask, x, y, x + 1, y);
+    Cons UB = neighbor_for_diff(U, mask, x, y, x, y - 1);
+    Cons UT = neighbor_for_diff(U, mask, x, y, x, y + 1);
+
+    double lap_rho = (UL.rho + UR.rho + UB.rho + UT.rho) - 4.0 * Uc.rho;
+    double lap_mx = (UL.mx + UR.mx + UB.mx + UT.mx) - 4.0 * Uc.mx;
+    double lap_my = (UL.my + UR.my + UB.my + UT.my) - 4.0 * Uc.my;
+    double lap_E = (UL.E + UR.E + UB.E + UT.E) - 4.0 * Uc.E;
+
+    Un.rho += (VISC_RHO * dt) * lap_rho;
+    Un.mx += (VISC_NU * dt) * lap_mx;
+    Un.my += (VISC_NU * dt) * lap_my;
+    Un.E += (VISC_E * dt) * lap_E;
+  }
+
   Un.rho = d_fmax(Un.rho, EPS_RHO);
   Prim pp = cons_to_prim(Un);
   if (pp.p <= EPS_P) {
@@ -671,15 +704,15 @@ __global__ void k_step(Usoa U, Usoa Unew, const uint8_t *mask, double dt_dx,
     Un = prim_to_cons(pp);
   }
 
-  store_cons(Unew, i, Un);
+  store_cons(Uout, i, Un);
 }
 
-__global__ void k_swap(Usoa U, Usoa Unew) {
+__global__ void k_copy(Usoa dst, Usoa src) {
   int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
   int N = W * H;
   if (i >= N)
     return;
-  store_cons(U, i, load_cons(Unew, i));
+  store_cons(dst, i, load_cons(src, i));
 }
 
 __device__ __forceinline__ uchar4 pack_rgba(uint8_t r, uint8_t g, uint8_t b) {
@@ -700,6 +733,31 @@ __device__ __forceinline__ void get_color(double t, uint8_t &r, uint8_t &g,
   b = (uint8_t)bb;
 }
 
+__device__ __forceinline__ Prim sample_prim_bc(const Usoa U,
+                                               const uint8_t *mask, int x,
+                                               int y) {
+  if (y < 0)
+    y = 0;
+  if (y >= H)
+    y = H - 1;
+
+  if (x < 0)
+    return inflow_state();
+  if (x >= W) {
+    int i = d_idx(W - 1, y);
+    return cons_to_prim(load_cons(U, i));
+  }
+
+  int i = d_idx(x, y);
+  if (mask[i]) {
+    // treat solid as stationary gas at inflow density/pressure for viz sampling
+    Prim infl = inflow_state();
+    return Prim{infl.rho, 0.0, 0.0, infl.p};
+  }
+  return cons_to_prim(load_cons(U, i));
+}
+
+// Pass A: compute val[] to tmpVal + block min/max
 __global__ void k_render_vals(const Usoa U, const uint8_t *mask, int view_mode,
                               double *tmpVal, double *blockMin,
                               double *blockMax) {
@@ -715,44 +773,44 @@ __global__ void k_render_vals(const Usoa U, const uint8_t *mask, int view_mode,
   double mx = -1e300;
 
   if (i < N && !mask[i]) {
-    Cons c = load_cons(U, i);
-    Prim p = cons_to_prim(c);
+    int x = i % W;
+    int y = i / W;
 
-    if (view_mode == 0)
+    Prim p = cons_to_prim(load_cons(U, i));
+
+    if (view_mode == 0) {
       v = log(p.rho);
-    else if (view_mode == 1)
+    } else if (view_mode == 1) {
       v = log(p.p);
-    else if (view_mode == 2)
+    } else if (view_mode == 2) {
       v = sqrt(p.u * p.u + p.v * p.v);
-    else {
-      // schlieren
-      int x = i % W;
-      int y = i / W;
-
-      auto sample_rho = [&](int sx, int sy) -> double {
-        if (sy < 0)
-          sy = 0;
-        if (sy >= H)
-          sy = H - 1;
-
-        if (sx < 0) {
-          return inflow_state().rho;
-        }
-        if (sx >= W) {
-          int j = d_idx(W - 1, sy);
-          return cons_to_prim(load_cons(U, j)).rho;
-        }
-        int j = d_idx(sx, sy);
-        return cons_to_prim(load_cons(U, j)).rho;
-      };
-
-      double rhoL = sample_rho(x - 1, y);
-      double rhoR = sample_rho(x + 1, y);
-      double rhoB = sample_rho(x, y - 1);
-      double rhoT = sample_rho(x, y + 1);
+    } else if (view_mode == 3) {
+      // schlieren: central diff of rho
+      double rhoL = sample_prim_bc(U, mask, x - 1, y).rho;
+      double rhoR = sample_prim_bc(U, mask, x + 1, y).rho;
+      double rhoB = sample_prim_bc(U, mask, x, y - 1).rho;
+      double rhoT = sample_prim_bc(U, mask, x, y + 1).rho;
       double gx = 0.5 * (rhoR - rhoL);
       double gy = 0.5 * (rhoT - rhoB);
       v = log(1e-12 + sqrt(gx * gx + gy * gy));
+    } else if (view_mode == 4) {
+      // vorticity omega = dv/dx - du/dy (central differences)
+      Prim pL = sample_prim_bc(U, mask, x - 1, y);
+      Prim pR = sample_prim_bc(U, mask, x + 1, y);
+      Prim pB = sample_prim_bc(U, mask, x, y - 1);
+      Prim pT = sample_prim_bc(U, mask, x, y + 1);
+      double dv_dx = 0.5 * (pR.v - pL.v);
+      double du_dy = 0.5 * (pT.u - pB.u);
+      double omega = dv_dx - du_dy;
+      v = asinh(omega); // preserves sign; auto-scaled by per-frame min/max
+    } else if (view_mode == 5) {
+      // Mach number
+      double a = sound_speed(p);
+      double sp = sqrt(p.u * p.u + p.v * p.v);
+      v = sp / d_fmax(a, 1e-30);
+    } else {
+      // log(T) with T ~ p/rho
+      v = log(d_fmax(p.p / d_fmax(p.rho, EPS_RHO), 1e-30));
     }
 
     tmpVal[i] = v;
@@ -848,8 +906,7 @@ static void reduce_minmax(double *d_min, double *d_max, int blocks,
 }
 
 int main(void) {
-  InitWindow(W * SCALE, H * SCALE,
-             "Hypersonic 2D Flow (CUDA MUSCL-Hancock + HLLC)");
+  InitWindow(W * SCALE, H * SCALE, "Hypersonic 2D Flow");
   SetTargetFPS(60);
 
   const int N = W * H;
@@ -863,9 +920,9 @@ int main(void) {
   img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
   Texture2D tex = LoadTextureFromImage(img);
 
-  Usoa dU{}, dUnew{};
+  Usoa dU{}, dUtmp{};
   alloc_Us(&dU, N);
-  alloc_Us(&dUnew, N);
+  alloc_Us(&dUtmp, N);
 
   uint8_t *dMask = nullptr;
   CK(cudaMalloc(&dMask, N * sizeof(uint8_t)));
@@ -896,7 +953,7 @@ int main(void) {
   gpu_init();
 
   double sim_t = 0.0;
-  int view_mode = 0;
+  int view_mode = 3;
 
   while (!WindowShouldClose()) {
     if (IsKeyPressed(KEY_R)) {
@@ -904,7 +961,7 @@ int main(void) {
       gpu_init();
     }
     if (IsKeyPressed(KEY_M))
-      view_mode = (view_mode + 1) % 4;
+      view_mode = (view_mode + 1) % 7;
 
     if (!IsKeyDown(KEY_SPACE)) {
       for (int k = 0; k < STEPS_PER_FRAME; k++) {
@@ -923,13 +980,12 @@ int main(void) {
         double half_dt_dx = 0.5 * dt_dx;
         double half_dt_dy = 0.5 * dt_dy;
 
-        // step
-        k_step<<<blocksN, threads>>>(dU, dUnew, dMask, dt_dx, dt_dy, half_dt_dx,
-                                     half_dt_dy);
+        k_step<<<blocksN, threads>>>(dU, dUtmp, dMask, dt, dt_dx, dt_dy,
+                                     half_dt_dx, half_dt_dy);
         CK(cudaGetLastError());
+        CK(cudaDeviceSynchronize());
 
-        // swap (copy new -> old)
-        k_swap<<<blocksN, threads>>>(dU, dUnew);
+        k_copy<<<blocksN, threads>>>(dU, dUtmp);
         CK(cudaGetLastError());
         CK(cudaDeviceSynchronize());
 
@@ -954,7 +1010,6 @@ int main(void) {
     CK(cudaGetLastError());
     CK(cudaDeviceSynchronize());
 
-    // copy pixels to host RGBA
     CK(cudaMemcpy(pixels, dPixels, N * sizeof(uchar4), cudaMemcpyDeviceToHost));
     UpdateTexture(tex, pixels);
 
@@ -965,17 +1020,26 @@ int main(void) {
                    (Vector2){0, 0}, 0.0f, WHITE);
 
     DrawText(TextFormat("t = %.4f", sim_t), 10, 10, 20, WHITE);
+
     const char *modestr = (view_mode == 0)   ? "log(rho)"
                           : (view_mode == 1) ? "log(p)"
                           : (view_mode == 2) ? "speed"
-                                             : "schlieren-ish";
+                          : (view_mode == 3) ? "schlieren"
+                          : (view_mode == 4) ? "vorticity (asinh)"
+                          : (view_mode == 5) ? "Mach"
+                                             : "log(p/rho)";
     DrawText(modestr, 10, 34, 20, GREEN);
-    DrawText("SPACE pause | R reset | M mode", 10, 58, 18,
+
+    DrawText(TextFormat("nu=%g  rho_nu=%g  E_nu=%g", (double)VISC_NU,
+                        (double)VISC_RHO, (double)VISC_E),
+             10, 58, 18, (Color){200, 200, 200, 255});
+    DrawText("SPACE pause | R reset | M mode", 10, 80, 18,
              (Color){200, 200, 200, 255});
     EndDrawing();
   }
 
   CloseWindow();
+
   free(pixels);
 
   cudaFree(dMask);
@@ -986,7 +1050,7 @@ int main(void) {
   cudaFree(dBlockMax2);
 
   free_Us(&dU);
-  free_Us(&dUnew);
+  free_Us(&dUtmp);
 
   return 0;
 }
