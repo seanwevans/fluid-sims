@@ -31,6 +31,7 @@ static inline void ck(cudaError_t e, const char *msg) {
     exit(1);
   }
 }
+
 #define CK(x) ck((x), #x)
 
 typedef struct {
@@ -40,17 +41,21 @@ typedef struct {
 static inline int h_idx(int x, int y) { return y * W + x; }
 
 __device__ __forceinline__ int d_idx(int x, int y) { return y * W + x; }
+
 __device__ __forceinline__ double d_fmax(double a, double b) {
   return a > b ? a : b;
 }
+
 __device__ __forceinline__ double d_fmin(double a, double b) {
   return a < b ? a : b;
 }
+
 __device__ __forceinline__ double d_fabs(double a) { return a < 0 ? -a : a; }
 
 struct Cons {
   double rho, mx, my, E;
 };
+
 struct Prim {
   double rho, u, v, p;
 };
@@ -132,6 +137,7 @@ __device__ __forceinline__ Prim inflow_state() {
 __device__ __forceinline__ Cons load_cons(const Usoa U, int i) {
   return Cons{U.rho[i], U.mx[i], U.my[i], U.E[i]};
 }
+
 __device__ __forceinline__ void store_cons(Usoa U, int i, Cons c) {
   U.rho[i] = c.rho;
   U.mx[i] = c.mx;
