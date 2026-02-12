@@ -1,7 +1,6 @@
 // tau_hypersonic_cuda.cu
 //
-//   nvcc -O3 -std=c++17 -arch=sm_86 tau_hypersonic_cuda.cu \
-//     -lraylib -lm -lpthread -ldl -lrt -lX11 -o tau_2d_cuda
+// nvcc -O3 -o tau_2d_hypersonic_cuda tau_hypersonic_cuda.cu -std=c++17 -lraylib
 //
 // Controls: SPACE pause, R reset, M mode
 //
@@ -23,19 +22,19 @@
 #include <string.h>
 
 #define W 1600
-#define H 720
+#define H 512
 #define SCALE 1
-#define STEPS_PER_FRAME 2
+#define STEPS_PER_FRAME 10
 
 #define EPS_RHO 1e-25
 #define EPS_P 1e-25
 
 #define GAMMA 1.4
-#define CFL 0.1250
+#define CFL 0.3333
 
-#define VISC_NU 1
-#define VISC_RHO 1
-#define VISC_E 1
+#define VISC_NU 1e-3
+#define VISC_RHO 1e-5
+#define VISC_E 1e-5
 
 static inline void ck(cudaError_t e, const char *msg) {
   if (e != cudaSuccess) {
@@ -62,18 +61,17 @@ struct FacePrim {
   Prim L, R;
 };
 
+// d_*
 __device__ __forceinline__ int d_idx(int x, int y) { return y * W + x; }
-
 __device__ __forceinline__ double d_fmax(double a, double b) {
   return a > b ? a : b;
 }
-
 __device__ __forceinline__ double d_fmin(double a, double b) {
   return a < b ? a : b;
 }
-
 __device__ __forceinline__ double d_fabs(double a) { return a < 0 ? -a : a; }
 
+// prims and cons
 __device__ __forceinline__ Prim cons_to_prim(Cons c) {
   Prim p;
   double rho = d_fmax(c.rho, EPS_RHO);
@@ -147,7 +145,7 @@ __device__ __forceinline__ Prim inflow_state() {
   const double p = 1.0;
   double a = sqrt(GAMMA * p / rho);
   double u = mach * a; // left -> right
-  double v = 0.002 * u;
+  double v = 0.05 * rho;
   return Prim{rho, u, v, p};
 }
 
@@ -464,6 +462,7 @@ __device__ __forceinline__ Cons hllc_y(Cons UL, Cons UR) {
   }
 }
 
+// device helpers
 __device__ __forceinline__ double clamp01(double t) {
   return t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
 }
@@ -570,6 +569,63 @@ __device__ __forceinline__ Prim sample_prim_bc(const Usoa U,
   return cons_to_prim(load_cons(U, i));
 }
 
+__device__ __forceinline__ double smoothMin(double a, double b, double k) {
+  // k > 0 : larger = rounder
+  double h = clamp01(0.5 + 0.5 * (b - a) / k);
+  return (1.0 - h) * b + h * a - k * h * (1.0 - h);
+}
+
+__device__ __forceinline__ double
+sdSphereConeCapsuleRounded(double x, double y, double Rb, double Rn,
+                           double theta, double k_round) {
+  double r = d_fabs(y);
+
+  double st = sin(theta);
+  double ct = cos(theta);
+  double tt = tan(theta);
+
+  double xt = Rn * (1.0 - st);
+  double rt = Rn * ct;
+  double xb = xt + (Rb - rt) / d_fmax(tt, 1e-30);
+
+  // inside test via profile
+  double rprof = 0.0;
+  if (x < 0.0) {
+    rprof = -1.0;
+  } else if (x <= xt) {
+    double dx = x - Rn;
+    double inside = Rn * Rn - dx * dx;
+    rprof = (inside > 0.0) ? sqrt(inside) : 0.0;
+  } else if (x <= xb) {
+    rprof = rt + (x - xt) * tt;
+  } else {
+    rprof = -1.0;
+  }
+  int inside = (x >= 0.0 && x <= xb && r <= rprof);
+
+  // primitive distances
+  double d_sphere = d_fabs(len2(x - Rn, r) - Rn);
+  double d_cone = sdSegment(x, r, xt, rt, xb, Rb);
+  double d_base = sdSegment(x, y, xb, -Rb, xb, +Rb);
+
+  // rounded unions: sphere ⊔ cone ⊔ base
+  double d = smoothMin(d_sphere, d_cone, k_round);
+  d = smoothMin(d, d_base, k_round);
+
+  return inside ? -d : d;
+}
+
+__device__ __forceinline__ double spherecone_xb(double Rb, double Rn,
+                                                double theta) {
+  double st = sin(theta);
+  double ct = cos(theta);
+  double tt = tan(theta);
+  double xt = Rn * (1.0 - st);
+  double rt = Rn * ct;
+  return xt + (Rb - rt) / d_fmax(tt, 1e-30);
+}
+
+// k_*
 __global__ void k_init(Usoa U, uint8_t *mask) {
   int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
   int N = W * H;
@@ -579,23 +635,23 @@ __global__ void k_init(Usoa U, uint8_t *mask) {
   int x = i % W;
   int y = i / W;
 
-  // Place nose tip at (x0, cy). Flow is left->right, so blunt nose should face
-  // left. With X = x - x0, the nose is at X=0 and the capsule extends
-  // downstream to +X.
   double x0 = (double)W / 12.0;
   double cy = (double)H / 2.0;
 
-  // Geometry knobs (Apollo-ish)
-  double Rb = (double)H / 6.0;
-  double Rn = 0.90 * Rb;
-  double theta = 33.0 * (PI / 180.0);
+  // Geometry knobs
+  double Rb = (double)H / 12.0;
+  double Rn = (double)H / 24.0;
+  double theta = PI / 4.0;
 
-  // Local coords (nose at X=0, centerline at Y=0)  <-- IMPORTANT ORIENTATION
-  // FIX
+  // Local coords (nose at X=0, centerline at Y=0)
   double X = (double)x - x0;
   double Y = (double)y - cy;
 
-  double sd = sdSphereConeCapsule(X, Y, Rb, Rn, theta);
+  double k_round = Rb;
+  double xb = spherecone_xb(Rb, Rn, theta);
+  double sd0 = sdSphereConeCapsule(X, Y, Rb, Rn, theta);
+  double sd = sd0 - k_round;
+  sd = d_fmax(sd, X - xb);
   uint8_t m = (sd < 0.0) ? 1 : 0;
   mask[i] = m;
 
@@ -652,6 +708,10 @@ __global__ void k_max_wavespeed(const Usoa U, const uint8_t *mask,
   if (tid == 0)
     blockMax[blockIdx.x] = smax[0];
 }
+
+// Replace your entire k_step(...) with this (same logic, just fixes the
+// brace/indent mess around the diffusion block + keeps the 9-point Laplacian
+// clean).
 
 __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
                        double dt_dx, double dt_dy, double half_dt_dx,
@@ -795,17 +855,61 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
   Un.my -= dt_dy * (GyT.my - GyB.my);
   Un.E -= dt_dy * (GyT.E - GyB.E);
 
-  // tiny diffusion
-  {
-    Cons UL = neighbor_for_diff(U, mask, x, y, x - 1, y);
-    Cons UR = neighbor_for_diff(U, mask, x, y, x + 1, y);
-    Cons UB = neighbor_for_diff(U, mask, x, y, x, y - 1);
-    Cons UT = neighbor_for_diff(U, mask, x, y, x, y + 1);
+  // Drop this in place of your current diffusion block inside k_step()
+  // (keeps the same "Un += nu*dt*lap" feature, just swaps lap to a 5x5 /
+  // 25-point stencil).
 
-    double lap_rho = (UL.rho + UR.rho + UB.rho + UT.rho) - 4.0 * Uc.rho;
-    double lap_mx = (UL.mx + UR.mx + UB.mx + UT.mx) - 4.0 * Uc.mx;
-    double lap_my = (UL.my + UR.my + UB.my + UT.my) - 4.0 * Uc.my;
-    double lap_E = (UL.E + UR.E + UB.E + UT.E) - 4.0 * Uc.E;
+  {
+    // 25-point Laplacian via separable 5-tap 2nd-derivative kernel:
+    // d2/dx2: [-1, 16, -30, 16, -1] / 12   (same for y)
+    // lap = d2x + d2y, dx=dy=1
+
+    const double inv12 = 1.0 / 12.0;
+
+    auto S = [&](int sx, int sy) -> Cons {
+      return neighbor_for_diff(U, mask, x, y, x + sx, y + sy);
+    };
+
+    // x second derivative (row y)
+    Cons xm2 = S(-2, 0);
+    Cons xm1 = S(-1, 0);
+    Cons xp1 = S(+1, 0);
+    Cons xp2 = S(+2, 0);
+
+    double d2x_rho =
+        (-xm2.rho + 16.0 * xm1.rho - 30.0 * Uc.rho + 16.0 * xp1.rho - xp2.rho) *
+        inv12;
+    double d2x_mx =
+        (-xm2.mx + 16.0 * xm1.mx - 30.0 * Uc.mx + 16.0 * xp1.mx - xp2.mx) *
+        inv12;
+    double d2x_my =
+        (-xm2.my + 16.0 * xm1.my - 30.0 * Uc.my + 16.0 * xp1.my - xp2.my) *
+        inv12;
+    double d2x_E =
+        (-xm2.E + 16.0 * xm1.E - 30.0 * Uc.E + 16.0 * xp1.E - xp2.E) * inv12;
+
+    // y second derivative (col x)
+    Cons ym2 = S(0, -2);
+    Cons ym1 = S(0, -1);
+    Cons yp1 = S(0, +1);
+    Cons yp2 = S(0, +2);
+
+    double d2y_rho =
+        (-ym2.rho + 16.0 * ym1.rho - 30.0 * Uc.rho + 16.0 * yp1.rho - yp2.rho) *
+        inv12;
+    double d2y_mx =
+        (-ym2.mx + 16.0 * ym1.mx - 30.0 * Uc.mx + 16.0 * yp1.mx - yp2.mx) *
+        inv12;
+    double d2y_my =
+        (-ym2.my + 16.0 * ym1.my - 30.0 * Uc.my + 16.0 * yp1.my - yp2.my) *
+        inv12;
+    double d2y_E =
+        (-ym2.E + 16.0 * ym1.E - 30.0 * Uc.E + 16.0 * yp1.E - yp2.E) * inv12;
+
+    double lap_rho = d2x_rho + d2y_rho;
+    double lap_mx = d2x_mx + d2y_mx;
+    double lap_my = d2x_my + d2y_my;
+    double lap_E = d2x_E + d2y_E;
 
     Un.rho += (VISC_RHO * dt) * lap_rho;
     Un.mx += (VISC_NU * dt) * lap_mx;
@@ -929,6 +1033,7 @@ __global__ void k_render_pixels(const uint8_t *mask, const double *tmpVal,
   out[i] = pack_rgba(r, g, b);
 }
 
+// general helpers
 static void alloc_Us(Usoa *U, int N) {
   CK(cudaMalloc(&U->rho, N * sizeof(double)));
   CK(cudaMalloc(&U->mx, N * sizeof(double)));
@@ -974,6 +1079,7 @@ static void reduce_minmax(double *d_min, double *d_max, int blocks,
   *outMax = mx;
 }
 
+// main
 int main(void) {
   InitWindow(W * SCALE, H * SCALE, "Hypersonic 2D Flow");
   SetTargetFPS(60);
@@ -1087,7 +1193,7 @@ int main(void) {
                    (Rectangle){0, 0, (float)(W * SCALE), (float)(H * SCALE)},
                    (Vector2){0, 0}, 0.0f, WHITE);
 
-    DrawText(TextFormat("t = %.4f", sim_t), 10, 10, 20, WHITE);
+    DrawText(TextFormat("%.6f", sim_t), 10, 10, 20, WHITE);
 
     const char *modestr = (view_mode == 0)   ? "log(rho)"
                           : (view_mode == 1) ? "log(p)"
@@ -1098,11 +1204,6 @@ int main(void) {
                                              : "log(p/rho)";
     DrawText(modestr, 10, 34, 20, GREEN);
 
-    DrawText(TextFormat("nu=%g  rho_nu=%g  E_nu=%g", (double)VISC_NU,
-                        (double)VISC_RHO, (double)VISC_E),
-             10, 58, 18, (Color){200, 200, 200, 255});
-    DrawText("SPACE pause | R reset | M mode", 10, 80, 18,
-             (Color){200, 200, 200, 255});
     EndDrawing();
   }
 
