@@ -1,11 +1,11 @@
 // tau_hypersonic_cuda.cu
 //
-//   nvcc -O3 -std=c++17 -arch=sm_86 tau_hypersonic_cuda_visc.cu \
+//   nvcc -O3 -std=c++17 -arch=sm_86 tau_hypersonic_cuda.cu \
 //     -lraylib -lm -lpthread -ldl -lrt -lX11 -o tau_2d_cuda
 //
 // Controls: SPACE pause, R reset, M mode
 //
-// View modes (M cycles):
+// View modes:
 //   0 log(rho)
 //   1 log(p)
 //   2 speed
@@ -25,26 +25,17 @@
 #define W 1600
 #define H 720
 #define SCALE 1
-
-#define GAMMA 1.4
-#define CFL 0.275
-
 #define STEPS_PER_FRAME 2
 
-#define EPS_RHO 1e-10
-#define EPS_P 1e-10
+#define EPS_RHO 1e-25
+#define EPS_P 1e-25
 
-#ifndef VISC_NU
-#define VISC_NU 0.002
-#endif
+#define GAMMA 1.4
+#define CFL 0.1250
 
-#ifndef VISC_RHO
-#define VISC_RHO 0.0005 // density diffusion
-#endif
-
-#ifndef VISC_E
-#define VISC_E 0.002 // energy diffusion
-#endif
+#define VISC_NU 1
+#define VISC_RHO 1
+#define VISC_E 1
 
 static inline void ck(cudaError_t e, const char *msg) {
   if (e != cudaSuccess) {
@@ -59,7 +50,17 @@ typedef struct {
   double *rho, *mx, *my, *E;
 } Usoa;
 
-static inline int h_idx(int x, int y) { return y * W + x; }
+struct Cons {
+  double rho, mx, my, E;
+};
+
+struct Prim {
+  double rho, u, v, p;
+};
+
+struct FacePrim {
+  Prim L, R;
+};
 
 __device__ __forceinline__ int d_idx(int x, int y) { return y * W + x; }
 
@@ -72,14 +73,6 @@ __device__ __forceinline__ double d_fmin(double a, double b) {
 }
 
 __device__ __forceinline__ double d_fabs(double a) { return a < 0 ? -a : a; }
-
-struct Cons {
-  double rho, mx, my, E;
-};
-
-struct Prim {
-  double rho, u, v, p;
-};
 
 __device__ __forceinline__ Prim cons_to_prim(Cons c) {
   Prim p;
@@ -149,12 +142,13 @@ __device__ __forceinline__ double mc_limiter(double dl, double dc, double dr) {
 }
 
 __device__ __forceinline__ Prim inflow_state() {
-  const double mach = 15.0;
+  const double mach = 25.0;
   const double rho = 1.0;
   const double p = 1.0;
   double a = sqrt(GAMMA * p / rho);
-  double u = mach * a;
-  return Prim{rho, u, 0.0, p};
+  double u = mach * a; // left -> right
+  double v = 0.002 * u;
+  return Prim{rho, u, v, p};
 }
 
 __device__ __forceinline__ Cons load_cons(const Usoa U, int i) {
@@ -220,10 +214,6 @@ __device__ __forceinline__ Cons neighbor_for_diff(const Usoa U,
   }
   return load_cons(U, j);
 }
-
-struct FacePrim {
-  Prim L, R;
-};
 
 __device__ __forceinline__ void enforce_positive_faces(Prim &qm, const Prim &qc,
                                                        Prim &qp) {
@@ -474,6 +464,112 @@ __device__ __forceinline__ Cons hllc_y(Cons UL, Cons UR) {
   }
 }
 
+__device__ __forceinline__ double clamp01(double t) {
+  return t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+}
+
+__device__ __forceinline__ double len2(double x, double y) {
+  return sqrt(x * x + y * y);
+}
+
+__device__ __forceinline__ double sdSegment(double px, double py, double ax,
+                                            double ay, double bx, double by) {
+  double abx = bx - ax, aby = by - ay;
+  double apx = px - ax, apy = py - ay;
+  double denom = abx * abx + aby * aby + 1e-30;
+  double t = (apx * abx + apy * aby) / denom;
+  t = clamp01(t);
+  double qx = ax + t * abx, qy = ay + t * aby;
+  return len2(px - qx, py - qy);
+}
+
+__device__ __forceinline__ double
+sdSphereConeCapsule(double x, double y, double Rb, double Rn, double theta) {
+  double r = d_fabs(y);
+
+  double st = sin(theta);
+  double ct = cos(theta);
+  double tt = tan(theta);
+
+  double xt = Rn * (1.0 - st);
+  double rt = Rn * ct;
+
+  double xb = xt + (Rb - rt) / d_fmax(tt, 1e-30);
+
+  // profile radius for inside test
+  double rprof = 0.0;
+  if (x < 0.0) {
+    rprof = -1.0;
+  } else if (x <= xt) {
+    double dx = x - Rn;
+    double inside = Rn * Rn - dx * dx;
+    rprof = (inside > 0.0) ? sqrt(inside) : 0.0;
+  } else if (x <= xb) {
+    rprof = rt + (x - xt) * tt;
+  } else {
+    rprof = -1.0;
+  }
+
+  int inside = (x >= 0.0 && x <= xb && r <= rprof);
+
+  // distances to boundary pieces
+  double d_sphere = d_fabs(len2(x - Rn, r) - Rn);
+  double d_cone = sdSegment(x, r, xt, rt, xb, Rb);
+  double d_base = sdSegment(x, y, xb, -Rb, xb, +Rb);
+  double d_rim = len2(x - xb, r - Rb);
+
+  double d = d_sphere;
+  if (d_cone < d)
+    d = d_cone;
+  if (d_base < d)
+    d = d_base;
+  if (d_rim < d)
+    d = d_rim;
+
+  return inside ? -d : d;
+}
+
+__device__ __forceinline__ uchar4 pack_rgba(uint8_t r, uint8_t g, uint8_t b) {
+  return uchar4{r, g, b, 255};
+}
+
+__device__ __forceinline__ void get_color(double t, uint8_t &r, uint8_t &g,
+                                          uint8_t &b) {
+  if (t < 0)
+    t = 0;
+  if (t > 1)
+    t = 1;
+  double rr = 255.0 * d_fmin(1.0, d_fmax(0.0, 3.0 * t - 1.0));
+  double gg = 255.0 * d_fmin(1.0, d_fmax(0.0, 2.0 - 4.0 * d_fabs(t - 0.5)));
+  double bb = 255.0 * d_fmin(1.0, d_fmax(0.0, 2.0 - 3.0 * t));
+  r = (uint8_t)rr;
+  g = (uint8_t)gg;
+  b = (uint8_t)bb;
+}
+
+__device__ __forceinline__ Prim sample_prim_bc(const Usoa U,
+                                               const uint8_t *mask, int x,
+                                               int y) {
+  if (y < 0)
+    y = 0;
+  if (y >= H)
+    y = H - 1;
+
+  if (x < 0)
+    return inflow_state();
+  if (x >= W) {
+    int i = d_idx(W - 1, y);
+    return cons_to_prim(load_cons(U, i));
+  }
+
+  int i = d_idx(x, y);
+  if (mask[i]) {
+    Prim infl = inflow_state();
+    return Prim{infl.rho, 0.0, 0.0, infl.p};
+  }
+  return cons_to_prim(load_cons(U, i));
+}
+
 __global__ void k_init(Usoa U, uint8_t *mask) {
   int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
   int N = W * H;
@@ -483,13 +579,24 @@ __global__ void k_init(Usoa U, uint8_t *mask) {
   int x = i % W;
   int y = i / W;
 
-  int cx = W / 3;
-  int cy = H / 2;
-  int r = H / 6;
+  // Place nose tip at (x0, cy). Flow is left->right, so blunt nose should face
+  // left. With X = x - x0, the nose is at X=0 and the capsule extends
+  // downstream to +X.
+  double x0 = (double)W / 12.0;
+  double cy = (double)H / 2.0;
 
-  int dx = x - cx;
-  int dy = y - cy;
-  uint8_t m = (dx * dx + dy * dy < r * r) ? 1 : 0;
+  // Geometry knobs (Apollo-ish)
+  double Rb = (double)H / 6.0;
+  double Rn = 0.90 * Rb;
+  double theta = 33.0 * (PI / 180.0);
+
+  // Local coords (nose at X=0, centerline at Y=0)  <-- IMPORTANT ORIENTATION
+  // FIX
+  double X = (double)x - x0;
+  double Y = (double)y - cy;
+
+  double sd = sdSphereConeCapsule(X, Y, Rb, Rn, theta);
+  uint8_t m = (sd < 0.0) ? 1 : 0;
   mask[i] = m;
 
   Prim inflow = inflow_state();
@@ -501,10 +608,19 @@ __global__ void k_apply_inflow_left(Usoa U, const uint8_t *mask) {
   int y = (int)(blockIdx.x * blockDim.x + threadIdx.x);
   if (y >= H)
     return;
+
   int i0 = d_idx(0, y);
-  if (!mask[i0]) {
-    store_cons(U, i0, prim_to_cons(inflow_state()));
-  }
+  if (mask[i0])
+    return;
+
+  Prim infl = inflow_state();
+
+  // tiny KH seed: 0.3% of u, sinusoidal in y
+  double eps = 0.003 * infl.u;
+  double s = sin(0.015 * (double)y);
+
+  Prim pin{infl.rho, infl.u, infl.v + eps * s, infl.p};
+  store_cons(U, i0, prim_to_cons(pin));
 }
 
 __global__ void k_max_wavespeed(const Usoa U, const uint8_t *mask,
@@ -537,7 +653,6 @@ __global__ void k_max_wavespeed(const Usoa U, const uint8_t *mask,
     blockMax[blockIdx.x] = smax[0];
 }
 
-// hyperbolic Euler step + tiny Laplacian diffusion
 __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
                        double dt_dx, double dt_dy, double half_dt_dx,
                        double half_dt_dy) {
@@ -610,7 +725,7 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
   Cons FxL = hllc_x(prim_to_cons(qL_left), prim_to_cons(qR_left));
   Cons FxR = hllc_x(prim_to_cons(qL_right), prim_to_cons(qR_right));
 
-  // Y
+  // Y faces
   Prim qB_bot, qT_bot;
   {
     if (y - 1 >= 0 && !mask[d_idx(x, y - 1)]) {
@@ -680,6 +795,7 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
   Un.my -= dt_dy * (GyT.my - GyB.my);
   Un.E -= dt_dy * (GyT.E - GyB.E);
 
+  // tiny diffusion
   {
     Cons UL = neighbor_for_diff(U, mask, x, y, x - 1, y);
     Cons UR = neighbor_for_diff(U, mask, x, y, x + 1, y);
@@ -715,49 +831,6 @@ __global__ void k_copy(Usoa dst, Usoa src) {
   store_cons(dst, i, load_cons(src, i));
 }
 
-__device__ __forceinline__ uchar4 pack_rgba(uint8_t r, uint8_t g, uint8_t b) {
-  return uchar4{r, g, b, 255};
-}
-
-__device__ __forceinline__ void get_color(double t, uint8_t &r, uint8_t &g,
-                                          uint8_t &b) {
-  if (t < 0)
-    t = 0;
-  if (t > 1)
-    t = 1;
-  double rr = 255.0 * d_fmin(1.0, d_fmax(0.0, 3.0 * t - 1.0));
-  double gg = 255.0 * d_fmin(1.0, d_fmax(0.0, 2.0 - 4.0 * d_fabs(t - 0.5)));
-  double bb = 255.0 * d_fmin(1.0, d_fmax(0.0, 2.0 - 3.0 * t));
-  r = (uint8_t)rr;
-  g = (uint8_t)gg;
-  b = (uint8_t)bb;
-}
-
-__device__ __forceinline__ Prim sample_prim_bc(const Usoa U,
-                                               const uint8_t *mask, int x,
-                                               int y) {
-  if (y < 0)
-    y = 0;
-  if (y >= H)
-    y = H - 1;
-
-  if (x < 0)
-    return inflow_state();
-  if (x >= W) {
-    int i = d_idx(W - 1, y);
-    return cons_to_prim(load_cons(U, i));
-  }
-
-  int i = d_idx(x, y);
-  if (mask[i]) {
-    // treat solid as stationary gas at inflow density/pressure for viz sampling
-    Prim infl = inflow_state();
-    return Prim{infl.rho, 0.0, 0.0, infl.p};
-  }
-  return cons_to_prim(load_cons(U, i));
-}
-
-// Pass A: compute val[] to tmpVal + block min/max
 __global__ void k_render_vals(const Usoa U, const uint8_t *mask, int view_mode,
                               double *tmpVal, double *blockMin,
                               double *blockMax) {
@@ -785,7 +858,6 @@ __global__ void k_render_vals(const Usoa U, const uint8_t *mask, int view_mode,
     } else if (view_mode == 2) {
       v = sqrt(p.u * p.u + p.v * p.v);
     } else if (view_mode == 3) {
-      // schlieren: central diff of rho
       double rhoL = sample_prim_bc(U, mask, x - 1, y).rho;
       double rhoR = sample_prim_bc(U, mask, x + 1, y).rho;
       double rhoB = sample_prim_bc(U, mask, x, y - 1).rho;
@@ -794,7 +866,6 @@ __global__ void k_render_vals(const Usoa U, const uint8_t *mask, int view_mode,
       double gy = 0.5 * (rhoT - rhoB);
       v = log(1e-12 + sqrt(gx * gx + gy * gy));
     } else if (view_mode == 4) {
-      // vorticity omega = dv/dx - du/dy (central differences)
       Prim pL = sample_prim_bc(U, mask, x - 1, y);
       Prim pR = sample_prim_bc(U, mask, x + 1, y);
       Prim pB = sample_prim_bc(U, mask, x, y - 1);
@@ -802,14 +873,12 @@ __global__ void k_render_vals(const Usoa U, const uint8_t *mask, int view_mode,
       double dv_dx = 0.5 * (pR.v - pL.v);
       double du_dy = 0.5 * (pT.u - pB.u);
       double omega = dv_dx - du_dy;
-      v = asinh(omega); // preserves sign; auto-scaled by per-frame min/max
+      v = asinh(omega);
     } else if (view_mode == 5) {
-      // Mach number
       double a = sound_speed(p);
       double sp = sqrt(p.u * p.u + p.v * p.v);
       v = sp / d_fmax(a, 1e-30);
     } else {
-      // log(T) with T ~ p/rho
       v = log(d_fmax(p.p / d_fmax(p.rho, EPS_RHO), 1e-30));
     }
 
@@ -1001,7 +1070,6 @@ int main(void) {
 
     double minv, maxv;
     reduce_minmax(dBlockMin, dBlockMax2, blocksN, &minv, &maxv);
-
     double invRange = 1.0 / fmax(maxv - minv, 1e-30);
 
     // render pass B: pixels
