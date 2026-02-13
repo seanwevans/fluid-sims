@@ -30,11 +30,11 @@
 #define EPS_P 1e-25
 
 #define GAMMA 1.1
-#define CFL 0.333
+#define CFL 0.25
 
-#define VISC_NU 1e-3
-#define VISC_RHO 1e-3
-#define VISC_E 1e-5
+#define VISC_NU 5e-2
+#define VISC_RHO 5e-2
+#define VISC_E 2e-2
 
 static inline void ck(cudaError_t e, const char *msg) {
   if (e != cudaSuccess) {
@@ -671,11 +671,11 @@ __global__ void k_apply_inflow_left(Usoa U, const uint8_t *mask) {
 
   Prim infl = inflow_state();
 
-  // tiny KH seed: 0.3% of u, sinusoidal in y
-  double eps = 0.003 * infl.u;
-  double s = sin(0.015 * (double)y);
+  // double eps = 0.003 * infl.u;
+  // double s = sin(0.015 * (double)y);
+  // Prim pin{infl.rho, infl.u, infl.v + eps * s, infl.p};
 
-  Prim pin{infl.rho, infl.u, infl.v + eps * s, infl.p};
+  Prim pin{infl.rho, infl.u, infl.v, infl.p};
   store_cons(U, i0, prim_to_cons(pin));
 }
 
@@ -708,10 +708,6 @@ __global__ void k_max_wavespeed(const Usoa U, const uint8_t *mask,
   if (tid == 0)
     blockMax[blockIdx.x] = smax[0];
 }
-
-// Replace your entire k_step(...) with this (same logic, just fixes the
-// brace/indent mess around the diffusion block + keeps the 9-point Laplacian
-// clean).
 
 __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
                        double dt_dx, double dt_dy, double half_dt_dx,
