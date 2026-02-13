@@ -24,16 +24,16 @@
 #define W 1600
 #define H 512
 #define SCALE 1
-#define STEPS_PER_FRAME 10
+#define STEPS_PER_FRAME 2
 
 #define EPS_RHO 1e-25
 #define EPS_P 1e-25
 
-#define GAMMA 1.4
-#define CFL 0.3333
+#define GAMMA 1.1
+#define CFL 0.333
 
 #define VISC_NU 1e-3
-#define VISC_RHO 1e-5
+#define VISC_RHO 1e-3
 #define VISC_E 1e-5
 
 static inline void ck(cudaError_t e, const char *msg) {
@@ -145,7 +145,7 @@ __device__ __forceinline__ Prim inflow_state() {
   const double p = 1.0;
   double a = sqrt(GAMMA * p / rho);
   double u = mach * a; // left -> right
-  double v = 0.05 * rho;
+  double v = 0;
   return Prim{rho, u, v, p};
 }
 
