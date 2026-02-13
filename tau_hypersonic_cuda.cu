@@ -855,10 +855,6 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
   Un.my -= dt_dy * (GyT.my - GyB.my);
   Un.E -= dt_dy * (GyT.E - GyB.E);
 
-  // Drop this in place of your current diffusion block inside k_step()
-  // (keeps the same "Un += nu*dt*lap" feature, just swaps lap to a 5x5 /
-  // 25-point stencil).
-
   {
     // 25-point Laplacian via separable 5-tap 2nd-derivative kernel:
     // d2/dx2: [-1, 16, -30, 16, -1] / 12   (same for y)
@@ -1082,7 +1078,7 @@ static void reduce_minmax(double *d_min, double *d_max, int blocks,
 // main
 int main(void) {
   InitWindow(W * SCALE, H * SCALE, "Hypersonic 2D Flow");
-  SetTargetFPS(60);
+  SetTargetFPS(999);
 
   const int N = W * H;
   unsigned char *pixels = (unsigned char *)malloc(N * 4);

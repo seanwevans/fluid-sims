@@ -1,5 +1,5 @@
 /* tau_hypersonic.c
-   gcc -O3 tau_hypersonic_2d_upgraded.c -lraylib -lm -o tau_2d
+   gcc -O3 tau_hypersonic.c -lraylib -lm -o tau_2d
    SPACE pause, R reset, M toggle view
  */
 
@@ -14,9 +14,9 @@
 #define SCALE 2
 
 #define GAMMA 1.4
-#define CFL 0.45
+#define CFL 0.3
 
-#define STEPS_PER_FRAME 10
+#define STEPS_PER_FRAME 2
 
 #define EPS_RHO 1e-10
 #define EPS_P 1e-10
@@ -801,7 +801,7 @@ int main(void) {
     const char *modestr = (view_mode == 0)   ? "log(rho)"
                           : (view_mode == 1) ? "log(p)"
                           : (view_mode == 2) ? "speed"
-                                             : "schlieren-ish";
+                                             : "schlieren";
     DrawText(modestr, 10, 34, 20, GREEN);
     DrawText("SPACE pause | R reset | M mode", 10, 58, 18,
              (Color){200, 200, 200, 255});
