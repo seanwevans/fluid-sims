@@ -1617,6 +1617,14 @@ int main(int argc, char **argv) {
   double *dBlockSpeedMax = nullptr;
   CK(cudaMalloc(&dBlockSpeedMax, (size_t)blocksN * sizeof(double)));
 
+  cudaStream_t dt_copy_stream = nullptr;
+  CK(cudaStreamCreateWithFlags(&dt_copy_stream, cudaStreamNonBlocking));
+  cudaEvent_t dt_ready_event = nullptr;
+  CK(cudaEventCreateWithFlags(&dt_ready_event, cudaEventDisableTiming));
+  double *hMaxSpeed = nullptr;
+  CK(cudaMallocHost(&hMaxSpeed, sizeof(double)));
+  *hMaxSpeed = 1e-12;
+
   auto gpu_init = [&]() {
     k_init<<<blocksN, threads>>>(dU, dMask);
     CK(cudaGetLastError());
@@ -1648,11 +1656,14 @@ int main(int argc, char **argv) {
         CK(cudaGetLastError());
         k_reduce_block_max<<<1, threads>>>(dBlockSpeedMax, blocksN, dMaxSpeed);
         CK(cudaGetLastError());
-        CK(cudaDeviceSynchronize());
 
-        double maxs = 1e-12;
-        CK(cudaMemcpy(&maxs, dMaxSpeed, sizeof(double),
-                      cudaMemcpyDeviceToHost));
+        CK(cudaEventRecord(dt_ready_event));
+        CK(cudaStreamWaitEvent(dt_copy_stream, dt_ready_event, 0));
+        CK(cudaMemcpyAsync(hMaxSpeed, dMaxSpeed, sizeof(double),
+                           cudaMemcpyDeviceToHost, dt_copy_stream));
+        CK(cudaStreamSynchronize(dt_copy_stream));
+
+        double maxs = *hMaxSpeed;
         if (!isfinite(maxs) || maxs < 1e-12)
           maxs = 1e-12;
 
@@ -1750,6 +1761,13 @@ int main(int argc, char **argv) {
   }
 
   // Deterministic cleanup in reverse allocation order.
+  if (hMaxSpeed)
+    CK(cudaFreeHost(hMaxSpeed));
+  if (dt_ready_event)
+    CK(cudaEventDestroy(dt_ready_event));
+  if (dt_copy_stream)
+    CK(cudaStreamDestroy(dt_copy_stream));
+
   free_cuda_ptr((void **)&dBlockSpeedMax);
   free_cuda_ptr((void **)&dMaxSpeed);
   free_cuda_ptr((void **)&dInvRange);
