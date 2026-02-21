@@ -734,22 +734,8 @@ __global__ void k_apply_inflow_left(Usoa U, const uint8_t *mask) {
   store_cons(U, i0, prim_to_cons(pin));
 }
 
-// Atomic max for positive doubles (bitwise monotonic for positive values)
-__device__ __forceinline__ void atomicMaxDoublePos(double *addr, double v) {
-  unsigned long long *uaddr = (unsigned long long *)addr;
-  unsigned long long old = *uaddr;
-  unsigned long long val = __double_as_longlong(v);
-  // only valid for v >= 0 and all stored values >= 0
-  while (old < val) {
-    unsigned long long prev = atomicCAS(uaddr, old, val);
-    if (prev == old)
-      break;
-    old = prev;
-  }
-}
-
-__global__ void k_max_wavespeed_atomic(const Usoa U, const uint8_t *mask,
-                                       double *outMax) {
+__global__ void k_max_wavespeed_blocks(const Usoa U, const uint8_t *mask,
+                                       double *blockMax) {
   __shared__ double smax[256];
   int tid = threadIdx.x;
   int N = W * H;
@@ -779,9 +765,36 @@ __global__ void k_max_wavespeed_atomic(const Usoa U, const uint8_t *mask,
     __syncthreads();
   }
 
-  if (tid == 0) {
-    atomicMaxDoublePos(outMax, smax[0]);
+  if (tid == 0)
+    blockMax[blockIdx.x] = smax[0];
+}
+
+__global__ void k_reduce_block_max(const double *blockMax, int nBlocks,
+                                   double *outMax) {
+  __shared__ double smax[256];
+  int tid = threadIdx.x;
+  double vmax = 1e-12;
+
+  for (int i = tid; i < nBlocks; i += blockDim.x) {
+    double v = blockMax[i];
+    if (v > vmax)
+      vmax = v;
   }
+
+  smax[tid] = vmax;
+  __syncthreads();
+
+  for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+    if (tid < off) {
+      double b = smax[tid + off];
+      if (b > smax[tid])
+        smax[tid] = b;
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0)
+    *outMax = smax[0];
 }
 
 __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
@@ -1180,6 +1193,9 @@ int main(void) {
   double *dMaxSpeed = nullptr;
   CK(cudaMalloc(&dMaxSpeed, sizeof(double)));
 
+  double *dBlockSpeedMax = nullptr;
+  CK(cudaMalloc(&dBlockSpeedMax, (size_t)blocksN * sizeof(double)));
+
   auto gpu_init = [&]() {
     k_init<<<blocksN, threads>>>(dU, dMask);
     CK(cudaGetLastError());
@@ -1205,9 +1221,11 @@ int main(void) {
                                                                       dMask);
         CK(cudaGetLastError());
 
-        // GPU reduction to a single max wavespeed (no host roundtrip per-block)
-        CK(cudaMemset(dMaxSpeed, 0, sizeof(double)));
-        k_max_wavespeed_atomic<<<blocksN, threads>>>(dU, dMask, dMaxSpeed);
+        // Two-stage GPU reduction to a single max wavespeed.
+        k_max_wavespeed_blocks<<<blocksN, threads>>>(dU, dMask,
+                                                     dBlockSpeedMax);
+        CK(cudaGetLastError());
+        k_reduce_block_max<<<1, threads>>>(dBlockSpeedMax, blocksN, dMaxSpeed);
         CK(cudaGetLastError());
         CK(cudaDeviceSynchronize());
 
@@ -1285,6 +1303,7 @@ int main(void) {
   cudaFree(dBlockMin);
   cudaFree(dBlockMax);
   cudaFree(dMaxSpeed);
+  cudaFree(dBlockSpeedMax);
 
   free_Us(&dU);
   free_Us(&dUtmp);
