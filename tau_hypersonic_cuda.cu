@@ -351,21 +351,9 @@ __device__ __forceinline__ void enforce_positive_faces(Prim &qm, const Prim &qc,
   qp.p = d_fmax(qp.p, EPS_P);
 }
 
-template <Axis AX>
-__device__ __forceinline__ FacePrim reconstruct_axis(const Usoa U,
-                                                     const uint8_t *mask,
-                                                     int x, int y) {
-  constexpr int DX = (AX == Axis::X) ? 1 : 0;
-  constexpr int DY = (AX == Axis::X) ? 0 : 1;
-
-  Cons Uc = load_cons(U, d_idx(x, y));
-  Cons Um = neighbor_or_wall(U, mask, x, y, -DX, -DY);
-  Cons Up = neighbor_or_wall(U, mask, x, y, +DX, +DY);
-
-  Prim qm = cons_to_prim(Um);
-  Prim qc = cons_to_prim(Uc);
-  Prim qp = cons_to_prim(Up);
-
+__device__ __forceinline__ FacePrim reconstruct_limited_faces(const Prim &qm,
+                                                              const Prim &qc,
+                                                              const Prim &qp) {
   double dl_rho = qc.rho - qm.rho, dr_rho = qp.rho - qc.rho;
   double dc_rho = 0.5 * (qp.rho - qm.rho);
   double s_rho = mc_limiter(dl_rho, dc_rho, dr_rho);
@@ -386,21 +374,21 @@ __device__ __forceinline__ FacePrim reconstruct_axis(const Usoa U,
           qc.p - 0.5 * s_p};
   Prim qR{qc.rho + 0.5 * s_rho, qc.u + 0.5 * s_u, qc.v + 0.5 * s_v,
           qc.p + 0.5 * s_p};
-
   enforce_positive_faces(qL, qc, qR);
   return FacePrim{qL, qR};
 }
 
-__device__ __forceinline__ FacePrim reconstruct_x(const Usoa U,
-                                                  const uint8_t *mask, int x,
-                                                  int y) {
-  return reconstruct_axis<Axis::X>(U, mask, x, y);
-}
-
-__device__ __forceinline__ FacePrim reconstruct_y(const Usoa U,
-                                                  const uint8_t *mask, int x,
-                                                  int y) {
-  return reconstruct_axis<Axis::Y>(U, mask, x, y);
+template <Axis AX>
+__device__ __forceinline__ FacePrim reconstruct_axis_tiled(
+    const Usoa U, const uint8_t *mask, const TileView &tv, const Prim &qc,
+    int x, int y) {
+  constexpr int DX = (AX == Axis::X) ? 1 : 0;
+  constexpr int DY = (AX == Axis::X) ? 0 : 1;
+  Prim qm = cons_to_prim(load_neighbor_or_wall_tiled(U, mask, tv, qc, x - DX,
+                                                     y - DY));
+  Prim qp = cons_to_prim(load_neighbor_or_wall_tiled(U, mask, tv, qc, x + DX,
+                                                     y + DY));
+  return reconstruct_limited_faces(qm, qc, qp);
 }
 
 template <Axis AX>
@@ -891,33 +879,7 @@ __global__ void k_predict_face_states(Usoa U, const uint8_t *mask,
   Cons Uc = tile_load_cons(tv, x, y);
   Prim qc = cons_to_prim(Uc);
 
-  Cons Umx = load_neighbor_or_wall_tiled(U, mask, tv, qc, x - 1, y);
-  Cons Upx = load_neighbor_or_wall_tiled(U, mask, tv, qc, x + 1, y);
-  Prim qmX = cons_to_prim(Umx);
-  Prim qpX = cons_to_prim(Upx);
-
-  double dl_rho_x = qc.rho - qmX.rho, dr_rho_x = qpX.rho - qc.rho;
-  double dc_rho_x = 0.5 * (qpX.rho - qmX.rho);
-  double s_rho_x = mc_limiter(dl_rho_x, dc_rho_x, dr_rho_x);
-
-  double dl_u_x = qc.u - qmX.u, dr_u_x = qpX.u - qc.u;
-  double dc_u_x = 0.5 * (qpX.u - qmX.u);
-  double s_u_x = mc_limiter(dl_u_x, dc_u_x, dr_u_x);
-
-  double dl_v_x = qc.v - qmX.v, dr_v_x = qpX.v - qc.v;
-  double dc_v_x = 0.5 * (qpX.v - qmX.v);
-  double s_v_x = mc_limiter(dl_v_x, dc_v_x, dr_v_x);
-
-  double dl_p_x = qc.p - qmX.p, dr_p_x = qpX.p - qc.p;
-  double dc_p_x = 0.5 * (qpX.p - qmX.p);
-  double s_p_x = mc_limiter(dl_p_x, dc_p_x, dr_p_x);
-
-  FacePrim fpCx;
-  fpCx.L = Prim{qc.rho - 0.5 * s_rho_x, qc.u - 0.5 * s_u_x,
-                qc.v - 0.5 * s_v_x, qc.p - 0.5 * s_p_x};
-  fpCx.R = Prim{qc.rho + 0.5 * s_rho_x, qc.u + 0.5 * s_u_x,
-                qc.v + 0.5 * s_v_x, qc.p + 0.5 * s_p_x};
-  enforce_positive_faces(fpCx.L, qc, fpCx.R);
+  FacePrim fpCx = reconstruct_axis_tiled<Axis::X>(U, mask, tv, qc, x, y);
 
   Cons fpCx_L = prim_to_cons(fpCx.L);
   Cons fpCx_R = prim_to_cons(fpCx.R);
@@ -937,33 +899,7 @@ __global__ void k_predict_face_states(Usoa U, const uint8_t *mask,
   store_cons(xL_states, i, prim_to_cons(qL));
   store_cons(xR_states, i, prim_to_cons(qR));
 
-  Cons Umy = load_neighbor_or_wall_tiled(U, mask, tv, qc, x, y - 1);
-  Cons Upy = load_neighbor_or_wall_tiled(U, mask, tv, qc, x, y + 1);
-  Prim qmY = cons_to_prim(Umy);
-  Prim qpY = cons_to_prim(Upy);
-
-  double dl_rho_y = qc.rho - qmY.rho, dr_rho_y = qpY.rho - qc.rho;
-  double dc_rho_y = 0.5 * (qpY.rho - qmY.rho);
-  double s_rho_y = mc_limiter(dl_rho_y, dc_rho_y, dr_rho_y);
-
-  double dl_u_y = qc.u - qmY.u, dr_u_y = qpY.u - qc.u;
-  double dc_u_y = 0.5 * (qpY.u - qmY.u);
-  double s_u_y = mc_limiter(dl_u_y, dc_u_y, dr_u_y);
-
-  double dl_v_y = qc.v - qmY.v, dr_v_y = qpY.v - qc.v;
-  double dc_v_y = 0.5 * (qpY.v - qmY.v);
-  double s_v_y = mc_limiter(dl_v_y, dc_v_y, dr_v_y);
-
-  double dl_p_y = qc.p - qmY.p, dr_p_y = qpY.p - qc.p;
-  double dc_p_y = 0.5 * (qpY.p - qmY.p);
-  double s_p_y = mc_limiter(dl_p_y, dc_p_y, dr_p_y);
-
-  FacePrim fpCy;
-  fpCy.L = Prim{qc.rho - 0.5 * s_rho_y, qc.u - 0.5 * s_u_y,
-                qc.v - 0.5 * s_v_y, qc.p - 0.5 * s_p_y};
-  fpCy.R = Prim{qc.rho + 0.5 * s_rho_y, qc.u + 0.5 * s_u_y,
-                qc.v + 0.5 * s_v_y, qc.p + 0.5 * s_p_y};
-  enforce_positive_faces(fpCy.L, qc, fpCy.R);
+  FacePrim fpCy = reconstruct_axis_tiled<Axis::Y>(U, mask, tv, qc, x, y);
 
   Cons fpCy_L = prim_to_cons(fpCy.L);
   Cons fpCy_R = prim_to_cons(fpCy.R);
