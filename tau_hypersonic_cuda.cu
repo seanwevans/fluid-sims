@@ -59,6 +59,36 @@ static inline void ck(cudaError_t e, const char *msg) {
 }
 #define CK(x) ck((x), #x)
 
+static void validate_reduction_launch_config(int threads,
+                                             size_t shared_bytes_per_array) {
+  if (threads <= 0 || (threads & (threads - 1)) != 0) {
+    fprintf(stderr,
+            "Invalid thread count %d: reductions require a positive power-of-two block size.\n",
+            threads);
+    exit(1);
+  }
+
+  int dev = 0;
+  CK(cudaGetDevice(&dev));
+  cudaDeviceProp prop{};
+  CK(cudaGetDeviceProperties(&prop, dev));
+
+  if (threads > prop.maxThreadsPerBlock) {
+    fprintf(stderr,
+            "Invalid thread count %d: device maxThreadsPerBlock is %d.\n",
+            threads, prop.maxThreadsPerBlock);
+    exit(1);
+  }
+
+  size_t shared_bytes = shared_bytes_per_array * (size_t)threads;
+  if (shared_bytes > prop.sharedMemPerBlock) {
+    fprintf(stderr,
+            "Invalid shared memory request %zu bytes: device sharedMemPerBlock is %zu bytes.\n",
+            shared_bytes, (size_t)prop.sharedMemPerBlock);
+    exit(1);
+  }
+}
+
 typedef struct {
   double *rho, *mx, *my, *E;
 } Usoa;
@@ -743,7 +773,7 @@ __global__ void k_apply_inflow_left(Usoa U, const uint8_t *mask) {
 
 __global__ void k_max_wavespeed_blocks(const Usoa U, const uint8_t *mask,
                                        double *blockMax) {
-  __shared__ double smax[256];
+  extern __shared__ double smax[];
   int tid = threadIdx.x;
   int N = W * H;
 
@@ -778,7 +808,7 @@ __global__ void k_max_wavespeed_blocks(const Usoa U, const uint8_t *mask,
 
 __global__ void k_reduce_block_max(const double *blockMax, int nBlocks,
                                    double *outMax) {
-  __shared__ double smax[256];
+  extern __shared__ double smax[];
   int tid = threadIdx.x;
   double vmax = 1e-12;
 
@@ -1137,8 +1167,9 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, Csoa xFlux,
 __global__ void k_render_vals(const Usoa U, const uint8_t *mask, int view_mode,
                               double *tmpVal, double *blockMin,
                               double *blockMax) {
-  __shared__ double smin[256];
-  __shared__ double smax[256];
+  extern __shared__ double sdata[];
+  double *smin = sdata;
+  double *smax = sdata + blockDim.x;
 
   int tid = threadIdx.x;
   int i = (int)(blockIdx.x * blockDim.x + tid);
@@ -1238,8 +1269,9 @@ __global__ void k_render_pixels(const uint8_t *mask, const double *tmpVal,
 
 __global__ void k_reduce_minmax(const double *inMin, const double *inMax,
                                 double *outMin, double *outMax, int n) {
-  __shared__ double smin[256];
-  __shared__ double smax[256];
+  extern __shared__ double sdata[];
+  double *smin = sdata;
+  double *smax = sdata + blockDim.x;
 
   int tid = threadIdx.x;
   int i0 = (int)(2 * blockIdx.x * blockDim.x + tid);
@@ -1516,6 +1548,10 @@ int main(int argc, char **argv) {
   CK(cudaMalloc(&dPixels, (size_t)N * sizeof(uchar4)));
 
   const int threads = 256;
+  const size_t reduceSharedBytes = (size_t)threads * sizeof(double);
+  const size_t reduceMinMaxSharedBytes = (size_t)threads * 2 * sizeof(double);
+  validate_reduction_launch_config(threads, 2 * sizeof(double));
+
   const int blocksN = (N + threads - 1) / threads;
   const int xFaceCount = (W + 1) * H;
   const int yFaceCount = W * (H + 1);
@@ -1587,10 +1623,11 @@ int main(int argc, char **argv) {
         CK(cudaGetLastError());
 
         // Two-stage GPU reduction to a single max wavespeed.
-        k_max_wavespeed_blocks<<<blocksN, threads>>>(dU, dMask,
-                                                     dBlockSpeedMax);
+        k_max_wavespeed_blocks<<<blocksN, threads, reduceSharedBytes>>>(
+            dU, dMask, dBlockSpeedMax);
         CK(cudaGetLastError());
-        k_reduce_block_max<<<1, threads>>>(dBlockSpeedMax, blocksN, dMaxSpeed);
+        k_reduce_block_max<<<1, threads, reduceSharedBytes>>>(dBlockSpeedMax,
+                                                        blocksN, dMaxSpeed);
         CK(cudaGetLastError());
 
         CK(cudaEventRecord(dt_ready_event));
@@ -1641,8 +1678,8 @@ int main(int argc, char **argv) {
     }
 
     // render pass A: vals + per-block min/max
-    k_render_vals<<<blocksN, threads>>>(dU, dMask, view_mode, dTmpVal,
-                                        dBlockMin, dBlockMax);
+    k_render_vals<<<blocksN, threads, reduceMinMaxSharedBytes>>>(
+        dU, dMask, view_mode, dTmpVal, dBlockMin, dBlockMax);
     CK(cudaGetLastError());
 
     const double *curMin = dBlockMin;
@@ -1652,7 +1689,8 @@ int main(int argc, char **argv) {
     int curN = blocksN;
     while (curN > 1) {
       int outN = (curN + (2 * threads - 1)) / (2 * threads);
-      k_reduce_minmax<<<outN, threads>>>(curMin, curMax, outMin, outMax, curN);
+      k_reduce_minmax<<<outN, threads, reduceMinMaxSharedBytes>>>(
+          curMin, curMax, outMin, outMax, curN);
       CK(cudaGetLastError());
       curN = outN;
       const double *nextMin = outMin;
