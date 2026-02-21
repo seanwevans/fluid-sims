@@ -117,8 +117,28 @@ __device__ __forceinline__ Cons flux_x(Cons c) {
   return f;
 }
 
+__device__ __forceinline__ Cons flux_x(Prim p) {
+  Cons c = prim_to_cons(p);
+  Cons f;
+  f.rho = c.mx;
+  f.mx = c.mx * p.u + p.p;
+  f.my = c.my * p.u;
+  f.E = (c.E + p.p) * p.u;
+  return f;
+}
+
 __device__ __forceinline__ Cons flux_y(Cons c) {
   Prim p = cons_to_prim(c);
+  Cons f;
+  f.rho = c.my;
+  f.mx = c.mx * p.v;
+  f.my = c.my * p.v + p.p;
+  f.E = (c.E + p.p) * p.v;
+  return f;
+}
+
+__device__ __forceinline__ Cons flux_y(Prim p) {
+  Cons c = prim_to_cons(p);
   Cons f;
   f.rho = c.my;
   f.mx = c.mx * p.v;
@@ -489,6 +509,12 @@ __device__ __forceinline__ Cons hllc_x(Cons UL, Cons UR) {
   }
 }
 
+__device__ __forceinline__ Cons hllc_x(Prim qL, Prim qR) {
+  Cons UL = prim_to_cons(qL);
+  Cons UR = prim_to_cons(qR);
+  return hllc_x(UL, UR);
+}
+
 __device__ __forceinline__ Cons hllc_y(Cons UL, Cons UR) {
   Prim L = cons_to_prim(UL);
   Prim R = cons_to_prim(UR);
@@ -570,6 +596,12 @@ __device__ __forceinline__ Cons hllc_y(Cons UL, Cons UR) {
     F.E = FR.E + SR * (UStarR.E - UR.E);
     return F;
   }
+}
+
+__device__ __forceinline__ Cons hllc_y(Prim qB, Prim qT) {
+  Cons UL = prim_to_cons(qB);
+  Cons UR = prim_to_cons(qT);
+  return hllc_y(UL, UR);
 }
 
 // device helpers
@@ -818,8 +850,10 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
   {
     if (x - 1 >= 0 && !mask[d_idx(x - 1, y)]) {
       FacePrim fp = reconstruct_x(U, mask, x - 1, y);
-      Cons FLf = flux_x(prim_to_cons(fp.R));
-      Cons FLb = flux_x(prim_to_cons(fp.L));
+      Cons fpL = prim_to_cons(fp.L);
+      Cons fpR = prim_to_cons(fp.R);
+      Cons FLf = flux_x(fpR);
+      Cons FLb = flux_x(fpL);
       qL_left =
           half_step_predict_x(fp.R, (FLf.rho - FLb.rho), (FLf.mx - FLb.mx),
                               (FLf.my - FLb.my), (FLf.E - FLb.E), half_dt_dx);
@@ -845,8 +879,10 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
 
     if (x + 1 < W && !mask[d_idx(x + 1, y)]) {
       FacePrim fpN = reconstruct_x(U, mask, x + 1, y);
-      Cons NFf = flux_x(prim_to_cons(fpN.R));
-      Cons NFb = flux_x(prim_to_cons(fpN.L));
+      Cons fpNL = prim_to_cons(fpN.L);
+      Cons fpNR = prim_to_cons(fpN.R);
+      Cons NFf = flux_x(fpNR);
+      Cons NFb = flux_x(fpNL);
       qR_right =
           half_step_predict_x(fpN.L, (NFf.rho - NFb.rho), (NFf.mx - NFb.mx),
                               (NFf.my - NFb.my), (NFf.E - NFb.E), half_dt_dx);
@@ -860,16 +896,23 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
     qR_right.p = d_fmax(qR_right.p, EPS_P);
   }
 
-  Cons FxL = hllc_x(prim_to_cons(qL_left), prim_to_cons(qR_left));
-  Cons FxR = hllc_x(prim_to_cons(qL_right), prim_to_cons(qR_right));
+  Cons qL_left_cons = prim_to_cons(qL_left);
+  Cons qR_left_cons = prim_to_cons(qR_left);
+  Cons qL_right_cons = prim_to_cons(qL_right);
+  Cons qR_right_cons = prim_to_cons(qR_right);
+
+  Cons FxL = hllc_x(qL_left_cons, qR_left_cons);
+  Cons FxR = hllc_x(qL_right_cons, qR_right_cons);
 
   // Y faces
   Prim qB_bot, qT_bot;
   {
     if (y - 1 >= 0 && !mask[d_idx(x, y - 1)]) {
       FacePrim fp = reconstruct_y(U, mask, x, y - 1);
-      Cons GBf = flux_y(prim_to_cons(fp.R));
-      Cons GBb = flux_y(prim_to_cons(fp.L));
+      Cons fpL = prim_to_cons(fp.L);
+      Cons fpR = prim_to_cons(fp.R);
+      Cons GBf = flux_y(fpR);
+      Cons GBb = flux_y(fpL);
       qB_bot =
           half_step_predict_y(fp.R, (GBf.rho - GBb.rho), (GBf.mx - GBb.mx),
                               (GBf.my - GBb.my), (GBf.E - GBb.E), half_dt_dy);
@@ -895,8 +938,10 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
 
     if (y + 1 < H && !mask[d_idx(x, y + 1)]) {
       FacePrim fpN = reconstruct_y(U, mask, x, y + 1);
-      Cons NFf = flux_y(prim_to_cons(fpN.R));
-      Cons NFb = flux_y(prim_to_cons(fpN.L));
+      Cons fpNL = prim_to_cons(fpN.L);
+      Cons fpNR = prim_to_cons(fpN.R);
+      Cons NFf = flux_y(fpNR);
+      Cons NFb = flux_y(fpNL);
       qT_top =
           half_step_predict_y(fpN.L, (NFf.rho - NFb.rho), (NFf.mx - NFb.mx),
                               (NFf.my - NFb.my), (NFf.E - NFb.E), half_dt_dy);
@@ -910,8 +955,13 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
     qT_top.p = d_fmax(qT_top.p, EPS_P);
   }
 
-  Cons GyB = hllc_y(prim_to_cons(qB_bot), prim_to_cons(qT_bot));
-  Cons GyT = hllc_y(prim_to_cons(qB_top), prim_to_cons(qT_top));
+  Cons qB_bot_cons = prim_to_cons(qB_bot);
+  Cons qT_bot_cons = prim_to_cons(qT_bot);
+  Cons qB_top_cons = prim_to_cons(qB_top);
+  Cons qT_top_cons = prim_to_cons(qT_top);
+
+  Cons GyB = hllc_y(qB_bot_cons, qT_bot_cons);
+  Cons GyT = hllc_y(qB_top_cons, qT_top_cons);
 
   // Hyperbolic update
   Cons Uc = load_cons(U, i);
