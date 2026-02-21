@@ -26,17 +26,26 @@
 #define W 1600
 #define H 512
 #define SCALE 1
-#define STEPS_PER_FRAME 2
 
 #define EPS_RHO 1e-25
 #define EPS_P 1e-25
 
-#define GAMMA 1.1
-#define CFL 0.25
+struct SimConfig {
+  double gamma;
+  double cfl;
+  double visc_nu;
+  double visc_rho;
+  double visc_e;
+  double inflow_mach;
+  double geom_x0;
+  double geom_cy;
+  double geom_Rb;
+  double geom_Rn;
+  double geom_theta;
+  int steps_per_frame;
+};
 
-#define VISC_NU 5e-2
-#define VISC_RHO 5e-2
-#define VISC_E 2e-2
+__constant__ SimConfig d_cfg;
 
 static inline void ck(cudaError_t e, const char *msg) {
   if (e != cudaSuccess) {
@@ -85,7 +94,7 @@ __device__ __forceinline__ Prim cons_to_prim(Cons c) {
 
   double kin = 0.5 * rho * (u * u + v * v);
   double eint = c.E - kin;
-  double pr = (GAMMA - 1.0) * d_fmax(eint, EPS_P);
+  double pr = (d_cfg.gamma - 1.0) * d_fmax(eint, EPS_P);
 
   p.rho = rho;
   p.u = u;
@@ -101,12 +110,12 @@ __device__ __forceinline__ Cons prim_to_cons(Prim p) {
   c.rho = rho;
   c.mx = rho * p.u;
   c.my = rho * p.v;
-  c.E = pr / (GAMMA - 1.0) + 0.5 * rho * (p.u * p.u + p.v * p.v);
+  c.E = pr / (d_cfg.gamma - 1.0) + 0.5 * rho * (p.u * p.u + p.v * p.v);
   return c;
 }
 
 __device__ __forceinline__ double sound_speed(Prim p) {
-  return sqrt(GAMMA * d_fmax(p.p, EPS_P) / d_fmax(p.rho, EPS_RHO));
+  return sqrt(d_cfg.gamma * d_fmax(p.p, EPS_P) / d_fmax(p.rho, EPS_RHO));
 }
 
 __device__ __forceinline__ Cons flux_x(Cons c) {
@@ -143,10 +152,10 @@ __device__ __forceinline__ double mc_limiter(double dl, double dc, double dr) {
 }
 
 __device__ __forceinline__ Prim inflow_state() {
-  const double mach = 25.0;
+  const double mach = d_cfg.inflow_mach;
   const double rho = 1.0;
   const double p = 1.0;
-  double a = sqrt(GAMMA * p / rho);
+  double a = sqrt(d_cfg.gamma * p / rho);
   double u = mach * a;
   double v = 0;
   return Prim{rho, u, v, p};
@@ -699,12 +708,12 @@ __global__ void k_init(Usoa U, uint8_t *mask) {
   int x = i % W;
   int y = i / W;
 
-  double x0 = (double)W / 12.0;
-  double cy = (double)H / 2.0;
+  double x0 = d_cfg.geom_x0;
+  double cy = d_cfg.geom_cy;
 
-  double Rb = (double)H / 12.0;
-  double Rn = (double)H / 24.0;
-  double theta = PI / 4.0;
+  double Rb = d_cfg.geom_Rb;
+  double Rn = d_cfg.geom_Rn;
+  double theta = d_cfg.geom_theta;
 
   double X = (double)x - x0;
   double Y = (double)y - cy;
@@ -972,10 +981,10 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
     double lap_my = d2x_my + d2y_my;
     double lap_E = d2x_E + d2y_E;
 
-    Un.rho += (VISC_RHO * dt) * lap_rho;
-    Un.mx += (VISC_NU * dt) * lap_mx;
-    Un.my += (VISC_NU * dt) * lap_my;
-    Un.E += (VISC_E * dt) * lap_E;
+    Un.rho += (d_cfg.visc_rho * dt) * lap_rho;
+    Un.mx += (d_cfg.visc_nu * dt) * lap_mx;
+    Un.my += (d_cfg.visc_nu * dt) * lap_my;
+    Un.E += (d_cfg.visc_e * dt) * lap_E;
   }
 
   Un.rho = d_fmax(Un.rho, EPS_RHO);
@@ -1142,9 +1151,133 @@ static inline void swap_Us(Usoa *a, Usoa *b) {
   b->E = t;
 }
 
-// main
+static SimConfig default_config() {
+  SimConfig cfg{};
+  cfg.gamma = 1.1;
+  cfg.cfl = 0.25;
+  cfg.visc_nu = 5e-2;
+  cfg.visc_rho = 5e-2;
+  cfg.visc_e = 2e-2;
+  cfg.inflow_mach = 25.0;
+  cfg.geom_x0 = (double)W / 12.0;
+  cfg.geom_cy = (double)H / 2.0;
+  cfg.geom_Rb = (double)H / 12.0;
+  cfg.geom_Rn = (double)H / 24.0;
+  cfg.geom_theta = PI / 4.0;
+  cfg.steps_per_frame = 2;
+  return cfg;
+}
+
+static void print_usage(const char *argv0) {
+  fprintf(stderr,
+          "Usage: %s [--mach M] [--gamma G] [--cfl C] [--visc-nu NU]\n"
+          "          [--visc-rho MU] [--visc-e K] [--steps-per-frame N]\n"
+          "          [--geom-x0 X0] [--geom-cy CY] [--geom-rb RB]\n"
+          "          [--geom-rn RN] [--geom-theta THETA]\n",
+          argv0);
+}
+
+static bool parse_double_flag(const char *name, const char *value, double *out) {
+  char *end = nullptr;
+  double v = strtod(value, &end);
+  if (!end || *end != '\0' || !isfinite(v)) {
+    fprintf(stderr, "Invalid value for %s: %s\n", name, value);
+    return false;
+  }
+  *out = v;
+  return true;
+}
+
+static bool parse_int_flag(const char *name, const char *value, int *out) {
+  char *end = nullptr;
+  long v = strtol(value, &end, 10);
+  if (!end || *end != '\0') {
+    fprintf(stderr, "Invalid value for %s: %s\n", name, value);
+    return false;
+  }
+  *out = (int)v;
+  return true;
+}
+
+static bool parse_args(int argc, char **argv, SimConfig *cfg) {
+  for (int i = 1; i < argc; i++) {
+    const char *arg = argv[i];
+    if (strcmp(arg, "--mach") == 0 && i + 1 < argc) {
+      if (!parse_double_flag(arg, argv[++i], &cfg->inflow_mach))
+        return false;
+    } else if (strcmp(arg, "--gamma") == 0 && i + 1 < argc) {
+      if (!parse_double_flag(arg, argv[++i], &cfg->gamma))
+        return false;
+    } else if (strcmp(arg, "--cfl") == 0 && i + 1 < argc) {
+      if (!parse_double_flag(arg, argv[++i], &cfg->cfl))
+        return false;
+    } else if (strcmp(arg, "--visc-nu") == 0 && i + 1 < argc) {
+      if (!parse_double_flag(arg, argv[++i], &cfg->visc_nu))
+        return false;
+    } else if (strcmp(arg, "--visc-rho") == 0 && i + 1 < argc) {
+      if (!parse_double_flag(arg, argv[++i], &cfg->visc_rho))
+        return false;
+    } else if (strcmp(arg, "--visc-e") == 0 && i + 1 < argc) {
+      if (!parse_double_flag(arg, argv[++i], &cfg->visc_e))
+        return false;
+    } else if (strcmp(arg, "--steps-per-frame") == 0 && i + 1 < argc) {
+      if (!parse_int_flag(arg, argv[++i], &cfg->steps_per_frame))
+        return false;
+    } else if (strcmp(arg, "--geom-x0") == 0 && i + 1 < argc) {
+      if (!parse_double_flag(arg, argv[++i], &cfg->geom_x0))
+        return false;
+    } else if (strcmp(arg, "--geom-cy") == 0 && i + 1 < argc) {
+      if (!parse_double_flag(arg, argv[++i], &cfg->geom_cy))
+        return false;
+    } else if (strcmp(arg, "--geom-rb") == 0 && i + 1 < argc) {
+      if (!parse_double_flag(arg, argv[++i], &cfg->geom_Rb))
+        return false;
+    } else if (strcmp(arg, "--geom-rn") == 0 && i + 1 < argc) {
+      if (!parse_double_flag(arg, argv[++i], &cfg->geom_Rn))
+        return false;
+    } else if (strcmp(arg, "--geom-theta") == 0 && i + 1 < argc) {
+      if (!parse_double_flag(arg, argv[++i], &cfg->geom_theta))
+        return false;
+    } else {
+      fprintf(stderr, "Unknown or incomplete argument: %s\n", arg);
+      return false;
+    }
+  }
+
+  if (cfg->gamma <= 1.0 || cfg->cfl <= 0.0 || cfg->visc_nu < 0.0 ||
+      cfg->visc_rho < 0.0 || cfg->visc_e < 0.0 || cfg->inflow_mach <= 0.0 ||
+      cfg->steps_per_frame <= 0 || cfg->geom_Rb <= 0.0 || cfg->geom_Rn <= 0.0 ||
+      cfg->geom_theta <= 0.0 || cfg->geom_theta >= 0.5 * PI) {
+    fprintf(stderr, "Invalid physical/geometry config values.\n");
+    return false;
+  }
+
+  return true;
+}
+
+static void print_config(const SimConfig &cfg) {
+  printf("SimConfig:\n");
+  printf("  gamma=%.8g\n", cfg.gamma);
+  printf("  cfl=%.8g\n", cfg.cfl);
+  printf("  visc_nu=%.8g\n", cfg.visc_nu);
+  printf("  visc_rho=%.8g\n", cfg.visc_rho);
+  printf("  visc_e=%.8g\n", cfg.visc_e);
+  printf("  inflow_mach=%.8g\n", cfg.inflow_mach);
+  printf("  steps_per_frame=%d\n", cfg.steps_per_frame);
+  printf("  geom_x0=%.8g geom_cy=%.8g geom_Rb=%.8g geom_Rn=%.8g geom_theta=%.8g\n",
+         cfg.geom_x0, cfg.geom_cy, cfg.geom_Rb, cfg.geom_Rn, cfg.geom_theta);
+}
+
 #ifndef TAU_HYPERSONIC_CUDA_NO_MAIN
-int main(void) {
+int main(int argc, char **argv) {
+  SimConfig h_cfg = default_config();
+  if (!parse_args(argc, argv, &h_cfg)) {
+    print_usage(argv[0]);
+    return 1;
+  }
+  print_config(h_cfg);
+  CK(cudaMemcpyToSymbol(d_cfg, &h_cfg, sizeof(SimConfig)));
+
   InitWindow(W * SCALE, H * SCALE, "Hypersonic 2D Flow");
   SetTargetFPS(999);
 
@@ -1203,7 +1336,7 @@ int main(void) {
       view_mode = (view_mode + 1) % 7;
 
     if (!IsKeyDown(KEY_SPACE)) {
-      for (int k = 0; k < STEPS_PER_FRAME; k++) {
+      for (int k = 0; k < h_cfg.steps_per_frame; k++) {
         k_apply_inflow_left<<<(H + threads - 1) / threads, threads>>>(dU,
                                                                       dMask);
         CK(cudaGetLastError());
@@ -1220,7 +1353,7 @@ int main(void) {
         if (!isfinite(maxs) || maxs < 1e-12)
           maxs = 1e-12;
 
-        double dt = CFL * 1.0 / maxs; // dx=dy=1
+        double dt = h_cfg.cfl * 1.0 / maxs; // dx=dy=1
         double dt_dx = dt;
         double dt_dy = dt;
         double half_dt_dx = 0.5 * dt_dx;
