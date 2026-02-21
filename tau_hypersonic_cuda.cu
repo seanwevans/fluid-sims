@@ -1,6 +1,7 @@
 // tau_hypersonic_cuda.cu
 //
 // nvcc -O3 -o tau_2d_hypersonic_cuda tau_hypersonic_cuda.cu -std=c++17 -lraylib
+// --use_fast_math
 //
 // Controls: SPACE pause, R reset, M mode
 //
@@ -70,6 +71,21 @@ __device__ __forceinline__ double d_fmin(double a, double b) {
   return a < b ? a : b;
 }
 __device__ __forceinline__ double d_fabs(double a) { return a < 0 ? -a : a; }
+
+// Warp reduction primitives
+__device__ __forceinline__ double warp_reduce_max(double val) {
+  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+    val = d_fmax(val, __shfl_down_sync(0xffffffff, val, offset));
+  }
+  return val;
+}
+
+__device__ __forceinline__ double warp_reduce_min(double val) {
+  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+    val = d_fmin(val, __shfl_down_sync(0xffffffff, val, offset));
+  }
+  return val;
+}
 
 // prims and cons
 __device__ __forceinline__ Prim cons_to_prim(Cons c) {
@@ -144,7 +160,7 @@ __device__ __forceinline__ Prim inflow_state() {
   const double rho = 1.0;
   const double p = 1.0;
   double a = sqrt(GAMMA * p / rho);
-  double u = mach * a; // left -> right
+  double u = mach * a;
   double v = 0;
   return Prim{rho, u, v, p};
 }
@@ -177,17 +193,15 @@ __device__ __forceinline__ Cons neighbor_or_wall(const Usoa U,
   if (yn >= H)
     yn = H - 1;
 
-  if (xn < 0) {
+  if (xn < 0)
     return prim_to_cons(inflow_state());
-  }
-  if (xn >= W) {
+  if (xn >= W)
     return load_cons(U, d_idx(W - 1, yn));
-  }
 
   int j = d_idx(xn, yn);
-  if (mask[j]) {
+  if (mask[j])
     return reflect_noslip(load_cons(U, d_idx(x, y)));
-  }
+
   return load_cons(U, j);
 }
 
@@ -199,17 +213,15 @@ __device__ __forceinline__ Cons neighbor_for_diff(const Usoa U,
   if (yn >= H)
     yn = H - 1;
 
-  if (xn < 0) {
+  if (xn < 0)
     return prim_to_cons(inflow_state());
-  }
-  if (xn >= W) {
+  if (xn >= W)
     return load_cons(U, d_idx(W - 1, yn));
-  }
 
   int j = d_idx(xn, yn);
-  if (mask[j]) {
+  if (mask[j])
     return reflect_noslip(load_cons(U, d_idx(xc, yc)));
-  }
+
   return load_cons(U, j);
 }
 
@@ -462,11 +474,9 @@ __device__ __forceinline__ Cons hllc_y(Cons UL, Cons UR) {
   }
 }
 
-// device helpers
 __device__ __forceinline__ double clamp01(double t) {
   return t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
 }
-
 __device__ __forceinline__ double len2(double x, double y) {
   return sqrt(x * x + y * y);
 }
@@ -485,17 +495,12 @@ __device__ __forceinline__ double sdSegment(double px, double py, double ax,
 __device__ __forceinline__ double
 sdSphereConeCapsule(double x, double y, double Rb, double Rn, double theta) {
   double r = d_fabs(y);
-
-  double st = sin(theta);
-  double ct = cos(theta);
-  double tt = tan(theta);
+  double st = sin(theta), ct = cos(theta), tt = tan(theta);
 
   double xt = Rn * (1.0 - st);
   double rt = Rn * ct;
-
   double xb = xt + (Rb - rt) / d_fmax(tt, 1e-30);
 
-  // profile radius for inside test
   double rprof = 0.0;
   if (x < 0.0) {
     rprof = -1.0;
@@ -511,7 +516,6 @@ sdSphereConeCapsule(double x, double y, double Rb, double Rn, double theta) {
 
   int inside = (x >= 0.0 && x <= xb && r <= rprof);
 
-  // distances to boundary pieces
   double d_sphere = d_fabs(len2(x - Rn, r) - Rn);
   double d_cone = sdSegment(x, r, xt, rt, xb, Rb);
   double d_base = sdSegment(x, y, xb, -Rb, xb, +Rb);
@@ -556,10 +560,8 @@ __device__ __forceinline__ Prim sample_prim_bc(const Usoa U,
 
   if (x < 0)
     return inflow_state();
-  if (x >= W) {
-    int i = d_idx(W - 1, y);
-    return cons_to_prim(load_cons(U, i));
-  }
+  if (x >= W)
+    return cons_to_prim(load_cons(U, d_idx(W - 1, y)));
 
   int i = d_idx(x, y);
   if (mask[i]) {
@@ -567,52 +569,6 @@ __device__ __forceinline__ Prim sample_prim_bc(const Usoa U,
     return Prim{infl.rho, 0.0, 0.0, infl.p};
   }
   return cons_to_prim(load_cons(U, i));
-}
-
-__device__ __forceinline__ double smoothMin(double a, double b, double k) {
-  // k > 0 : larger = rounder
-  double h = clamp01(0.5 + 0.5 * (b - a) / k);
-  return (1.0 - h) * b + h * a - k * h * (1.0 - h);
-}
-
-__device__ __forceinline__ double
-sdSphereConeCapsuleRounded(double x, double y, double Rb, double Rn,
-                           double theta, double k_round) {
-  double r = d_fabs(y);
-
-  double st = sin(theta);
-  double ct = cos(theta);
-  double tt = tan(theta);
-
-  double xt = Rn * (1.0 - st);
-  double rt = Rn * ct;
-  double xb = xt + (Rb - rt) / d_fmax(tt, 1e-30);
-
-  // inside test via profile
-  double rprof = 0.0;
-  if (x < 0.0) {
-    rprof = -1.0;
-  } else if (x <= xt) {
-    double dx = x - Rn;
-    double inside = Rn * Rn - dx * dx;
-    rprof = (inside > 0.0) ? sqrt(inside) : 0.0;
-  } else if (x <= xb) {
-    rprof = rt + (x - xt) * tt;
-  } else {
-    rprof = -1.0;
-  }
-  int inside = (x >= 0.0 && x <= xb && r <= rprof);
-
-  // primitive distances
-  double d_sphere = d_fabs(len2(x - Rn, r) - Rn);
-  double d_cone = sdSegment(x, r, xt, rt, xb, Rb);
-  double d_base = sdSegment(x, y, xb, -Rb, xb, +Rb);
-
-  // rounded unions: sphere ⊔ cone ⊔ base
-  double d = smoothMin(d_sphere, d_cone, k_round);
-  d = smoothMin(d, d_base, k_round);
-
-  return inside ? -d : d;
 }
 
 __device__ __forceinline__ double spherecone_xb(double Rb, double Rn,
@@ -625,11 +581,9 @@ __device__ __forceinline__ double spherecone_xb(double Rb, double Rn,
   return xt + (Rb - rt) / d_fmax(tt, 1e-30);
 }
 
-// k_*
 __global__ void k_init(Usoa U, uint8_t *mask) {
-  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-  int N = W * H;
-  if (i >= N)
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= W * H)
     return;
 
   int x = i % W;
@@ -638,12 +592,10 @@ __global__ void k_init(Usoa U, uint8_t *mask) {
   double x0 = (double)W / 12.0;
   double cy = (double)H / 2.0;
 
-  // Geometry knobs
   double Rb = (double)H / 12.0;
   double Rn = (double)H / 24.0;
   double theta = PI / 4.0;
 
-  // Local coords (nose at X=0, centerline at Y=0)
   double X = (double)x - x0;
   double Y = (double)y - cy;
 
@@ -661,7 +613,7 @@ __global__ void k_init(Usoa U, uint8_t *mask) {
 }
 
 __global__ void k_apply_inflow_left(Usoa U, const uint8_t *mask) {
-  int y = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  int y = blockIdx.x * blockDim.x + threadIdx.x;
   if (y >= H)
     return;
 
@@ -670,51 +622,47 @@ __global__ void k_apply_inflow_left(Usoa U, const uint8_t *mask) {
     return;
 
   Prim infl = inflow_state();
-
-  // double eps = 0.003 * infl.u;
-  // double s = sin(0.015 * (double)y);
-  // Prim pin{infl.rho, infl.u, infl.v + eps * s, infl.p};
-
-  Prim pin{infl.rho, infl.u, infl.v, infl.p};
-  store_cons(U, i0, prim_to_cons(pin));
+  store_cons(U, i0, prim_to_cons(infl));
 }
 
 __global__ void k_max_wavespeed(const Usoa U, const uint8_t *mask,
                                 double *blockMax) {
   __shared__ double smax[256];
   int tid = threadIdx.x;
-  int i = (int)(blockIdx.x * blockDim.x + tid);
-  int N = W * H;
+  int i = blockIdx.x * blockDim.x + tid;
 
   double v = 1e-12;
-  if (i < N && !mask[i]) {
+  if (i < W * H && !mask[i]) {
     Prim p = cons_to_prim(load_cons(U, i));
     double a = sound_speed(p);
     double sx = d_fabs(p.u) + a;
     double sy = d_fabs(p.v) + a;
-    v = (sx > sy) ? sx : sy;
+    v = d_fmax(sx, sy);
   }
   smax[tid] = v;
   __syncthreads();
 
-  for (int off = blockDim.x / 2; off > 0; off >>= 1) {
-    if (tid < off) {
-      double b = smax[tid + off];
-      if (b > smax[tid])
-        smax[tid] = b;
-    }
+  // Shared memory reduction
+  for (int off = blockDim.x / 2; off >= 32; off >>= 1) {
+    if (tid < off)
+      smax[tid] = d_fmax(smax[tid], smax[tid + off]);
     __syncthreads();
   }
-  if (tid == 0)
-    blockMax[blockIdx.x] = smax[0];
+
+  // Warp reduction
+  if (tid < 32) {
+    double my_val = smax[tid];
+    my_val = warp_reduce_max(my_val);
+    if (tid == 0)
+      blockMax[blockIdx.x] = my_val;
+  }
 }
 
 __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
                        double dt_dx, double dt_dy, double half_dt_dx,
                        double half_dt_dy) {
-  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-  int N = W * H;
-  if (i >= N)
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= W * H)
     return;
 
   if (mask[i]) {
@@ -725,7 +673,6 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
   int x = i % W;
   int y = i / W;
 
-  // X faces
   Prim qL_left, qR_left;
   {
     if (x - 1 >= 0 && !mask[d_idx(x - 1, y)]) {
@@ -781,7 +728,6 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
   Cons FxL = hllc_x(prim_to_cons(qL_left), prim_to_cons(qR_left));
   Cons FxR = hllc_x(prim_to_cons(qL_right), prim_to_cons(qR_right));
 
-  // Y faces
   Prim qB_bot, qT_bot;
   {
     if (y - 1 >= 0 && !mask[d_idx(x, y - 1)]) {
@@ -837,7 +783,6 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
   Cons GyB = hllc_y(prim_to_cons(qB_bot), prim_to_cons(qT_bot));
   Cons GyT = hllc_y(prim_to_cons(qB_top), prim_to_cons(qT_top));
 
-  // Hyperbolic update
   Cons Uc = load_cons(U, i);
   Cons Un = Uc;
 
@@ -852,17 +797,11 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
   Un.E -= dt_dy * (GyT.E - GyB.E);
 
   {
-    // 25-point Laplacian via separable 5-tap 2nd-derivative kernel:
-    // d2/dx2: [-1, 16, -30, 16, -1] / 12   (same for y)
-    // lap = d2x + d2y, dx=dy=1
-
     const double inv12 = 1.0 / 12.0;
-
     auto S = [&](int sx, int sy) -> Cons {
       return neighbor_for_diff(U, mask, x, y, x + sx, y + sy);
     };
 
-    // x second derivative (row y)
     Cons xm2 = S(-2, 0);
     Cons xm1 = S(-1, 0);
     Cons xp1 = S(+1, 0);
@@ -880,7 +819,6 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
     double d2x_E =
         (-xm2.E + 16.0 * xm1.E - 30.0 * Uc.E + 16.0 * xp1.E - xp2.E) * inv12;
 
-    // y second derivative (col x)
     Cons ym2 = S(0, -2);
     Cons ym1 = S(0, -1);
     Cons yp1 = S(0, +1);
@@ -898,15 +836,10 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
     double d2y_E =
         (-ym2.E + 16.0 * ym1.E - 30.0 * Uc.E + 16.0 * yp1.E - yp2.E) * inv12;
 
-    double lap_rho = d2x_rho + d2y_rho;
-    double lap_mx = d2x_mx + d2y_mx;
-    double lap_my = d2x_my + d2y_my;
-    double lap_E = d2x_E + d2y_E;
-
-    Un.rho += (VISC_RHO * dt) * lap_rho;
-    Un.mx += (VISC_NU * dt) * lap_mx;
-    Un.my += (VISC_NU * dt) * lap_my;
-    Un.E += (VISC_E * dt) * lap_E;
+    Un.rho += (VISC_RHO * dt) * (d2x_rho + d2y_rho);
+    Un.mx += (VISC_NU * dt) * (d2x_mx + d2y_mx);
+    Un.my += (VISC_NU * dt) * (d2x_my + d2y_my);
+    Un.E += (VISC_E * dt) * (d2x_E + d2y_E);
   }
 
   Un.rho = d_fmax(Un.rho, EPS_RHO);
@@ -920,11 +853,9 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
 }
 
 __global__ void k_copy(Usoa dst, Usoa src) {
-  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-  int N = W * H;
-  if (i >= N)
-    return;
-  store_cons(dst, i, load_cons(src, i));
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < W * H)
+    store_cons(dst, i, load_cons(src, i));
 }
 
 __global__ void k_render_vals(const Usoa U, const uint8_t *mask, int view_mode,
@@ -934,14 +865,13 @@ __global__ void k_render_vals(const Usoa U, const uint8_t *mask, int view_mode,
   __shared__ double smax[256];
 
   int tid = threadIdx.x;
-  int i = (int)(blockIdx.x * blockDim.x + tid);
-  int N = W * H;
+  int i = blockIdx.x * blockDim.x + tid;
 
   double v = 0.0;
   double mn = 1e300;
   double mx = -1e300;
 
-  if (i < N && !mask[i]) {
+  if (i < W * H && !mask[i]) {
     int x = i % W;
     int y = i / W;
 
@@ -981,7 +911,7 @@ __global__ void k_render_vals(const Usoa U, const uint8_t *mask, int view_mode,
     tmpVal[i] = v;
     mn = v;
     mx = v;
-  } else if (i < N) {
+  } else if (i < W * H) {
     tmpVal[i] = 0.0;
   }
 
@@ -989,29 +919,30 @@ __global__ void k_render_vals(const Usoa U, const uint8_t *mask, int view_mode,
   smax[tid] = mx;
   __syncthreads();
 
-  for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+  for (int off = blockDim.x / 2; off >= 32; off >>= 1) {
     if (tid < off) {
-      double bmin = smin[tid + off];
-      double bmax = smax[tid + off];
-      if (bmin < smin[tid])
-        smin[tid] = bmin;
-      if (bmax > smax[tid])
-        smax[tid] = bmax;
+      smin[tid] = d_fmin(smin[tid], smin[tid + off]);
+      smax[tid] = d_fmax(smax[tid], smax[tid + off]);
     }
     __syncthreads();
   }
 
-  if (tid == 0) {
-    blockMin[blockIdx.x] = smin[0];
-    blockMax[blockIdx.x] = smax[0];
+  if (tid < 32) {
+    double my_min = smin[tid];
+    double my_max = smax[tid];
+    my_min = warp_reduce_min(my_min);
+    my_max = warp_reduce_max(my_max);
+    if (tid == 0) {
+      blockMin[blockIdx.x] = my_min;
+      blockMax[blockIdx.x] = my_max;
+    }
   }
 }
 
 __global__ void k_render_pixels(const uint8_t *mask, const double *tmpVal,
                                 double minv, double invRange, uchar4 *out) {
-  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-  int N = W * H;
-  if (i >= N)
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= W * H)
     return;
 
   if (mask[i]) {
@@ -1025,7 +956,34 @@ __global__ void k_render_pixels(const uint8_t *mask, const double *tmpVal,
   out[i] = pack_rgba(r, g, b);
 }
 
-// general helpers
+// Memory-friendly reduction wrappers
+static double reduce_max(double *d_block, double *h_block, int blocks) {
+  CK(cudaMemcpy(h_block, d_block, blocks * sizeof(double),
+                cudaMemcpyDeviceToHost));
+  double m = 1e-12;
+  for (int i = 0; i < blocks; i++) {
+    if (h_block[i] > m)
+      m = h_block[i];
+  }
+  return m;
+}
+
+static void reduce_minmax(double *d_min, double *d_max, double *h_min,
+                          double *h_max, int blocks, double *outMin,
+                          double *outMax) {
+  CK(cudaMemcpy(h_min, d_min, blocks * sizeof(double), cudaMemcpyDeviceToHost));
+  CK(cudaMemcpy(h_max, d_max, blocks * sizeof(double), cudaMemcpyDeviceToHost));
+  double mn = 1e300, mx = -1e300;
+  for (int i = 0; i < blocks; i++) {
+    if (h_min[i] < mn)
+      mn = h_min[i];
+    if (h_max[i] > mx)
+      mx = h_max[i];
+  }
+  *outMin = mn;
+  *outMax = mx;
+}
+
 static void alloc_Us(Usoa *U, int N) {
   CK(cudaMalloc(&U->rho, N * sizeof(double)));
   CK(cudaMalloc(&U->mx, N * sizeof(double)));
@@ -1041,37 +999,6 @@ static void free_Us(Usoa *U) {
   U->rho = U->mx = U->my = U->E = nullptr;
 }
 
-static double reduce_max(double *d_block, int blocks) {
-  double *h = (double *)malloc(blocks * sizeof(double));
-  CK(cudaMemcpy(h, d_block, blocks * sizeof(double), cudaMemcpyDeviceToHost));
-  double m = 1e-12;
-  for (int i = 0; i < blocks; i++)
-    if (h[i] > m)
-      m = h[i];
-  free(h);
-  return m;
-}
-
-static void reduce_minmax(double *d_min, double *d_max, int blocks,
-                          double *outMin, double *outMax) {
-  double *hmin = (double *)malloc(blocks * sizeof(double));
-  double *hmax = (double *)malloc(blocks * sizeof(double));
-  CK(cudaMemcpy(hmin, d_min, blocks * sizeof(double), cudaMemcpyDeviceToHost));
-  CK(cudaMemcpy(hmax, d_max, blocks * sizeof(double), cudaMemcpyDeviceToHost));
-  double mn = 1e300, mx = -1e300;
-  for (int i = 0; i < blocks; i++) {
-    if (hmin[i] < mn)
-      mn = hmin[i];
-    if (hmax[i] > mx)
-      mx = hmax[i];
-  }
-  free(hmin);
-  free(hmax);
-  *outMin = mn;
-  *outMax = mx;
-}
-
-// main
 int main(void) {
   InitWindow(W * SCALE, H * SCALE, "Hypersonic 2D Flow");
   SetTargetFPS(999);
@@ -1104,12 +1031,16 @@ int main(void) {
   const int blocksN = (N + threads - 1) / threads;
 
   double *dBlockMax = nullptr;
-  CK(cudaMalloc(&dBlockMax, blocksN * sizeof(double)));
-
   double *dBlockMin = nullptr;
   double *dBlockMax2 = nullptr;
+  CK(cudaMalloc(&dBlockMax, blocksN * sizeof(double)));
   CK(cudaMalloc(&dBlockMin, blocksN * sizeof(double)));
   CK(cudaMalloc(&dBlockMax2, blocksN * sizeof(double)));
+
+  // Host reduction buffers pre-allocated here
+  double *hBlockMax = (double *)malloc(blocksN * sizeof(double));
+  double *hBlockMin = (double *)malloc(blocksN * sizeof(double));
+  double *hBlockMax2 = (double *)malloc(blocksN * sizeof(double));
 
   auto gpu_init = [&]() {
     k_init<<<blocksN, threads>>>(dU, dMask);
@@ -1140,8 +1071,8 @@ int main(void) {
         CK(cudaGetLastError());
         CK(cudaDeviceSynchronize());
 
-        double maxs = reduce_max(dBlockMax, blocksN);
-        double dt = CFL * 1.0 / maxs; // dx=dy=1
+        double maxs = reduce_max(dBlockMax, hBlockMax, blocksN);
+        double dt = CFL * 1.0 / maxs;
         double dt_dx = dt;
         double dt_dy = dt;
         double half_dt_dx = 0.5 * dt_dx;
@@ -1160,17 +1091,16 @@ int main(void) {
       }
     }
 
-    // render pass A: vals + per-block min/max
     k_render_vals<<<blocksN, threads>>>(dU, dMask, view_mode, dTmpVal,
                                         dBlockMin, dBlockMax2);
     CK(cudaGetLastError());
     CK(cudaDeviceSynchronize());
 
     double minv, maxv;
-    reduce_minmax(dBlockMin, dBlockMax2, blocksN, &minv, &maxv);
+    reduce_minmax(dBlockMin, dBlockMax2, hBlockMin, hBlockMax2, blocksN, &minv,
+                  &maxv);
     double invRange = 1.0 / fmax(maxv - minv, 1e-30);
 
-    // render pass B: pixels
     k_render_pixels<<<blocksN, threads>>>(dMask, dTmpVal, minv, invRange,
                                           dPixels);
     CK(cudaGetLastError());
@@ -1202,6 +1132,9 @@ int main(void) {
   CloseWindow();
 
   free(pixels);
+  free(hBlockMax);
+  free(hBlockMin);
+  free(hBlockMax2);
 
   cudaFree(dMask);
   cudaFree(dTmpVal);
