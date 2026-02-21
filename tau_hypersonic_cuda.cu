@@ -1072,7 +1072,8 @@ __global__ void k_render_vals(const Usoa U, const uint8_t *mask, int view_mode,
 }
 
 __global__ void k_render_pixels(const uint8_t *mask, const double *tmpVal,
-                                double minv, double invRange, uchar4 *out) {
+                                const double *minv, const double *invRange,
+                                uchar4 *out) {
   int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
   int N = W * H;
   if (i >= N)
@@ -1083,10 +1084,64 @@ __global__ void k_render_pixels(const uint8_t *mask, const double *tmpVal,
     return;
   }
 
-  double t = (tmpVal[i] - minv) * invRange;
+  double t = (tmpVal[i] - minv[0]) * invRange[0];
   uint8_t r, g, b;
   get_color(t, r, g, b);
   out[i] = pack_rgba(r, g, b);
+}
+
+__global__ void k_reduce_minmax(const double *inMin, const double *inMax,
+                                double *outMin, double *outMax, int n) {
+  __shared__ double smin[256];
+  __shared__ double smax[256];
+
+  int tid = threadIdx.x;
+  int i0 = (int)(2 * blockIdx.x * blockDim.x + tid);
+
+  double mn = 1e300;
+  double mx = -1e300;
+
+  if (i0 < n) {
+    mn = inMin[i0];
+    mx = inMax[i0];
+  }
+
+  int i1 = i0 + blockDim.x;
+  if (i1 < n) {
+    double mn1 = inMin[i1];
+    double mx1 = inMax[i1];
+    if (mn1 < mn)
+      mn = mn1;
+    if (mx1 > mx)
+      mx = mx1;
+  }
+
+  smin[tid] = mn;
+  smax[tid] = mx;
+  __syncthreads();
+
+  for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+    if (tid < off) {
+      double bmin = smin[tid + off];
+      double bmax = smax[tid + off];
+      if (bmin < smin[tid])
+        smin[tid] = bmin;
+      if (bmax > smax[tid])
+        smax[tid] = bmax;
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    outMin[blockIdx.x] = smin[0];
+    outMax[blockIdx.x] = smax[0];
+  }
+}
+
+__global__ void k_compute_inv_range(const double *minv, const double *maxv,
+                                    double *invRange) {
+  double range = d_fmax(maxv[0] - minv[0], 1e-30);
+  invRange[0] = 1.0 / range;
 }
 
 // general helpers
@@ -1103,25 +1158,6 @@ static void free_Us(Usoa *U) {
   cudaFree(U->my);
   cudaFree(U->E);
   U->rho = U->mx = U->my = U->E = nullptr;
-}
-
-static void reduce_minmax(double *d_min, double *d_max, int blocks,
-                          double *outMin, double *outMax) {
-  double *hmin = (double *)malloc(blocks * sizeof(double));
-  double *hmax = (double *)malloc(blocks * sizeof(double));
-  CK(cudaMemcpy(hmin, d_min, blocks * sizeof(double), cudaMemcpyDeviceToHost));
-  CK(cudaMemcpy(hmax, d_max, blocks * sizeof(double), cudaMemcpyDeviceToHost));
-  double mn = 1e300, mx = -1e300;
-  for (int i = 0; i < blocks; i++) {
-    if (hmin[i] < mn)
-      mn = hmin[i];
-    if (hmax[i] > mx)
-      mx = hmax[i];
-  }
-  free(hmin);
-  free(hmax);
-  *outMin = mn;
-  *outMax = mx;
 }
 
 static inline void swap_Us(Usoa *a, Usoa *b) {
@@ -1176,6 +1212,14 @@ int main(void) {
   double *dBlockMax = nullptr;
   CK(cudaMalloc(&dBlockMin, (size_t)blocksN * sizeof(double)));
   CK(cudaMalloc(&dBlockMax, (size_t)blocksN * sizeof(double)));
+
+  double *dReduceMin = nullptr;
+  double *dReduceMax = nullptr;
+  CK(cudaMalloc(&dReduceMin, (size_t)blocksN * sizeof(double)));
+  CK(cudaMalloc(&dReduceMax, (size_t)blocksN * sizeof(double)));
+
+  double *dInvRange = nullptr;
+  CK(cudaMalloc(&dInvRange, sizeof(double)));
 
   double *dMaxSpeed = nullptr;
   CK(cudaMalloc(&dMaxSpeed, sizeof(double)));
@@ -1241,12 +1285,28 @@ int main(void) {
     CK(cudaGetLastError());
     CK(cudaDeviceSynchronize());
 
-    double minv, maxv;
-    reduce_minmax(dBlockMin, dBlockMax, blocksN, &minv, &maxv);
-    double invRange = 1.0 / fmax(maxv - minv, 1e-30);
+    const double *curMin = dBlockMin;
+    const double *curMax = dBlockMax;
+    double *outMin = dReduceMin;
+    double *outMax = dReduceMax;
+    int curN = blocksN;
+    while (curN > 1) {
+      int outN = (curN + (2 * threads - 1)) / (2 * threads);
+      k_reduce_minmax<<<outN, threads>>>(curMin, curMax, outMin, outMax, curN);
+      CK(cudaGetLastError());
+      curN = outN;
+      const double *nextMin = outMin;
+      const double *nextMax = outMax;
+      outMin = (nextMin == dBlockMin) ? dReduceMin : dBlockMin;
+      outMax = (nextMax == dBlockMax) ? dReduceMax : dBlockMax;
+      curMin = nextMin;
+      curMax = nextMax;
+    }
+    k_compute_inv_range<<<1, 1>>>(curMin, curMax, dInvRange);
+    CK(cudaGetLastError());
 
     // render pass B: pixels
-    k_render_pixels<<<blocksN, threads>>>(dMask, dTmpVal, minv, invRange,
+    k_render_pixels<<<blocksN, threads>>>(dMask, dTmpVal, curMin, dInvRange,
                                           dPixels);
     CK(cudaGetLastError());
     CK(cudaDeviceSynchronize());
@@ -1284,6 +1344,9 @@ int main(void) {
   cudaFree(dPixels);
   cudaFree(dBlockMin);
   cudaFree(dBlockMax);
+  cudaFree(dReduceMin);
+  cudaFree(dReduceMax);
+  cudaFree(dInvRange);
   cudaFree(dMaxSpeed);
 
   free_Us(&dU);
