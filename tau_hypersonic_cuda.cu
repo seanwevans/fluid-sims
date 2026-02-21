@@ -13,7 +13,9 @@
 //   5 Mach
 //   6 log(p/rho)
 
+#ifndef TAU_HYPERSONIC_CUDA_NO_RAYLIB
 #include "raylib.h"
+#endif
 #include <cuda_runtime.h>
 #include <math.h>
 #include <stdint.h>
@@ -1141,6 +1143,7 @@ static inline void swap_Us(Usoa *a, Usoa *b) {
 }
 
 // main
+#ifndef TAU_HYPERSONIC_CUDA_NO_MAIN
 int main(void) {
   InitWindow(W * SCALE, H * SCALE, "Hypersonic 2D Flow");
   SetTargetFPS(999);
@@ -1291,3 +1294,4 @@ int main(void) {
 
   return 0;
 }
+#endif
