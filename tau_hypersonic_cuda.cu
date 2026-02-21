@@ -1362,12 +1362,13 @@ static void alloc_Us(Usoa *U, int N) {
   CK(cudaMalloc(&U->E, N * sizeof(double)));
 }
 
+static void free_cuda_ptr(void **ptr);
+
 static void free_Us(Usoa *U) {
-  cudaFree(U->rho);
-  cudaFree(U->mx);
-  cudaFree(U->my);
-  cudaFree(U->E);
-  U->rho = U->mx = U->my = U->E = nullptr;
+  free_cuda_ptr((void **)&U->rho);
+  free_cuda_ptr((void **)&U->mx);
+  free_cuda_ptr((void **)&U->my);
+  free_cuda_ptr((void **)&U->E);
 }
 
 static void free_cuda_ptr(void **ptr) {
@@ -1389,11 +1390,10 @@ static void alloc_Cs(Csoa *A, int N) {
 }
 
 static void free_Cs(Csoa *A) {
-  cudaFree(A->rho);
-  cudaFree(A->mx);
-  cudaFree(A->my);
-  cudaFree(A->E);
-  A->rho = A->mx = A->my = A->E = nullptr;
+  free_cuda_ptr((void **)&A->rho);
+  free_cuda_ptr((void **)&A->mx);
+  free_cuda_ptr((void **)&A->my);
+  free_cuda_ptr((void **)&A->E);
 }
 
 static inline void swap_Us(Usoa *a, Usoa *b) {
