@@ -61,6 +61,10 @@ typedef struct {
   double *rho, *mx, *my, *E;
 } Usoa;
 
+typedef struct {
+  double *rho, *mx, *my, *E;
+} Csoa;
+
 struct Cons {
   double rho, mx, my, E;
 };
@@ -195,6 +199,17 @@ __device__ __forceinline__ void store_cons(Usoa U, int i, Cons c) {
   U.mx[i] = c.mx;
   U.my[i] = c.my;
   U.E[i] = c.E;
+}
+
+__device__ __forceinline__ Cons load_cons(const Csoa A, int i) {
+  return Cons{A.rho[i], A.mx[i], A.my[i], A.E[i]};
+}
+
+__device__ __forceinline__ void store_cons(Csoa A, int i, Cons c) {
+  A.rho[i] = c.rho;
+  A.mx[i] = c.mx;
+  A.my[i] = c.my;
+  A.E[i] = c.E;
 }
 
 __device__ __forceinline__ Prim wall_ghost_prim(Prim inside) {
@@ -745,9 +760,137 @@ __global__ void k_reduce_block_max(const double *blockMax, int nBlocks,
     *outMax = smax[0];
 }
 
-__global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
-                       double dt_dx, double dt_dy, double half_dt_dx,
-                       double half_dt_dy) {
+__global__ void k_predict_face_states(Usoa U, const uint8_t *mask,
+                                      Csoa xL_states, Csoa xR_states,
+                                      Csoa yL_states, Csoa yR_states,
+                                      double half_dt_dx,
+                                      double half_dt_dy) {
+  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  int N = W * H;
+  if (i >= N)
+    return;
+
+  if (mask[i]) {
+    Cons Uc = load_cons(U, i);
+    store_cons(xL_states, i, Uc);
+    store_cons(xR_states, i, Uc);
+    store_cons(yL_states, i, Uc);
+    store_cons(yR_states, i, Uc);
+    return;
+  }
+
+  int x = i % W;
+  int y = i / W;
+
+  FacePrim fpCx = reconstruct_x(U, mask, x, y);
+  Cons fpCx_L = prim_to_cons(fpCx.L);
+  Cons fpCx_R = prim_to_cons(fpCx.R);
+  Cons fpCx_FL = flux_x(fpCx_L);
+  Cons fpCx_FR = flux_x(fpCx_R);
+
+  Prim qL = half_step_predict_x(
+      fpCx.L, (fpCx_FR.rho - fpCx_FL.rho), (fpCx_FR.mx - fpCx_FL.mx),
+      (fpCx_FR.my - fpCx_FL.my), (fpCx_FR.E - fpCx_FL.E), half_dt_dx);
+  Prim qR = half_step_predict_x(
+      fpCx.R, (fpCx_FR.rho - fpCx_FL.rho), (fpCx_FR.mx - fpCx_FL.mx),
+      (fpCx_FR.my - fpCx_FL.my), (fpCx_FR.E - fpCx_FL.E), half_dt_dx);
+  qL.rho = d_fmax(qL.rho, EPS_RHO);
+  qL.p = d_fmax(qL.p, EPS_P);
+  qR.rho = d_fmax(qR.rho, EPS_RHO);
+  qR.p = d_fmax(qR.p, EPS_P);
+  store_cons(xL_states, i, prim_to_cons(qL));
+  store_cons(xR_states, i, prim_to_cons(qR));
+
+  FacePrim fpCy = reconstruct_y(U, mask, x, y);
+  Cons fpCy_L = prim_to_cons(fpCy.L);
+  Cons fpCy_R = prim_to_cons(fpCy.R);
+  Cons fpCy_GL = flux_y(fpCy_L);
+  Cons fpCy_GR = flux_y(fpCy_R);
+
+  Prim qB = half_step_predict_y(
+      fpCy.L, (fpCy_GR.rho - fpCy_GL.rho), (fpCy_GR.mx - fpCy_GL.mx),
+      (fpCy_GR.my - fpCy_GL.my), (fpCy_GR.E - fpCy_GL.E), half_dt_dy);
+  Prim qT = half_step_predict_y(
+      fpCy.R, (fpCy_GR.rho - fpCy_GL.rho), (fpCy_GR.mx - fpCy_GL.mx),
+      (fpCy_GR.my - fpCy_GL.my), (fpCy_GR.E - fpCy_GL.E), half_dt_dy);
+  qB.rho = d_fmax(qB.rho, EPS_RHO);
+  qB.p = d_fmax(qB.p, EPS_P);
+  qT.rho = d_fmax(qT.rho, EPS_RHO);
+  qT.p = d_fmax(qT.p, EPS_P);
+  store_cons(yL_states, i, prim_to_cons(qB));
+  store_cons(yR_states, i, prim_to_cons(qT));
+}
+
+__global__ void k_compute_xface_flux(Usoa U, const uint8_t *mask,
+                                     Csoa xL_states, Csoa xR_states,
+                                     Csoa xFlux) {
+  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  int NF = (W + 1) * H;
+  if (i >= NF)
+    return;
+
+  int fx = i % (W + 1);
+  int y = i / (W + 1);
+  int xl = fx - 1;
+  int xr = fx;
+
+  bool hasL = (xl >= 0) && !mask[d_idx(xl, y)];
+  bool hasR = (xr < W) && !mask[d_idx(xr, y)];
+
+  Cons UL{}, UR{};
+  if (hasL && hasR) {
+    UL = load_cons(xR_states, d_idx(xl, y));
+    UR = load_cons(xL_states, d_idx(xr, y));
+  } else if (hasR) {
+    UL = neighbor_or_wall(U, mask, xr, y, -1, 0);
+    UR = load_cons(xL_states, d_idx(xr, y));
+  } else if (hasL) {
+    UL = load_cons(xR_states, d_idx(xl, y));
+    UR = neighbor_or_wall(U, mask, xl, y, +1, 0);
+  } else {
+    store_cons(xFlux, i, Cons{0.0, 0.0, 0.0, 0.0});
+    return;
+  }
+
+  store_cons(xFlux, i, hllc_x(UL, UR));
+}
+
+__global__ void k_compute_yface_flux(Usoa U, const uint8_t *mask,
+                                     Csoa yL_states, Csoa yR_states,
+                                     Csoa yFlux) {
+  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  int NF = W * (H + 1);
+  if (i >= NF)
+    return;
+
+  int x = i % W;
+  int fy = i / W;
+  int yb = fy - 1;
+  int yt = fy;
+
+  bool hasB = (yb >= 0) && !mask[d_idx(x, yb)];
+  bool hasT = (yt < H) && !mask[d_idx(x, yt)];
+
+  Cons UB{}, UT{};
+  if (hasB && hasT) {
+    UB = load_cons(yR_states, d_idx(x, yb));
+    UT = load_cons(yL_states, d_idx(x, yt));
+  } else if (hasT) {
+    UB = neighbor_or_wall(U, mask, x, yt, 0, -1);
+    UT = load_cons(yL_states, d_idx(x, yt));
+  } else if (hasB) {
+    UB = load_cons(yR_states, d_idx(x, yb));
+    UT = neighbor_or_wall(U, mask, x, yb, 0, +1);
+  } else {
+    store_cons(yFlux, i, Cons{0.0, 0.0, 0.0, 0.0});
+    return;
+  }
+
+  store_cons(yFlux, i, hllc_y(UB, UT));
+}
+
+__global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, Csoa xFlux,
+                       Csoa yFlux, double dt, double dt_dx, double dt_dy) {
   int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
   int N = W * H;
   if (i >= N)
@@ -761,136 +904,10 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
   int x = i % W;
   int y = i / W;
 
-  // Reuse center reconstructions for both adjacent faces.
-  FacePrim fpCx = reconstruct_x(U, mask, x, y);
-  Cons fpCx_L = prim_to_cons(fpCx.L);
-  Cons fpCx_R = prim_to_cons(fpCx.R);
-  Cons fpCx_FL = flux_x(fpCx_L);
-  Cons fpCx_FR = flux_x(fpCx_R);
-
-  FacePrim fpCy = reconstruct_y(U, mask, x, y);
-  Cons fpCy_L = prim_to_cons(fpCy.L);
-  Cons fpCy_R = prim_to_cons(fpCy.R);
-  Cons fpCy_GL = flux_y(fpCy_L);
-  Cons fpCy_GR = flux_y(fpCy_R);
-
-  // X faces
-  Prim qL_left, qR_left;
-  {
-    if (x - 1 >= 0 && !mask[d_idx(x - 1, y)]) {
-      FacePrim fp = reconstruct_x(U, mask, x - 1, y);
-      Cons fpL = prim_to_cons(fp.L);
-      Cons fpR = prim_to_cons(fp.R);
-      Cons FLf = flux_x(fpR);
-      Cons FLb = flux_x(fpL);
-      qL_left =
-          half_step_predict_x(fp.R, (FLf.rho - FLb.rho), (FLf.mx - FLb.mx),
-                              (FLf.my - FLb.my), (FLf.E - FLb.E), half_dt_dx);
-    } else {
-      qL_left = cons_to_prim(neighbor_or_wall(U, mask, x, y, -1, 0));
-    }
-
-    qR_left = half_step_predict_x(
-        fpCx.L, (fpCx_FR.rho - fpCx_FL.rho), (fpCx_FR.mx - fpCx_FL.mx),
-        (fpCx_FR.my - fpCx_FL.my), (fpCx_FR.E - fpCx_FL.E), half_dt_dx);
-
-    qL_left.rho = d_fmax(qL_left.rho, EPS_RHO);
-    qL_left.p = d_fmax(qL_left.p, EPS_P);
-    qR_left.rho = d_fmax(qR_left.rho, EPS_RHO);
-    qR_left.p = d_fmax(qR_left.p, EPS_P);
-  }
-
-  Prim qL_right, qR_right;
-  {
-    qL_right = half_step_predict_x(
-        fpCx.R, (fpCx_FR.rho - fpCx_FL.rho), (fpCx_FR.mx - fpCx_FL.mx),
-        (fpCx_FR.my - fpCx_FL.my), (fpCx_FR.E - fpCx_FL.E), half_dt_dx);
-
-    if (x + 1 < W && !mask[d_idx(x + 1, y)]) {
-      FacePrim fpN = reconstruct_x(U, mask, x + 1, y);
-      Cons fpNL = prim_to_cons(fpN.L);
-      Cons fpNR = prim_to_cons(fpN.R);
-      Cons NFf = flux_x(fpNR);
-      Cons NFb = flux_x(fpNL);
-      qR_right =
-          half_step_predict_x(fpN.L, (NFf.rho - NFb.rho), (NFf.mx - NFb.mx),
-                              (NFf.my - NFb.my), (NFf.E - NFb.E), half_dt_dx);
-    } else {
-      qR_right = cons_to_prim(neighbor_or_wall(U, mask, x, y, +1, 0));
-    }
-
-    qL_right.rho = d_fmax(qL_right.rho, EPS_RHO);
-    qL_right.p = d_fmax(qL_right.p, EPS_P);
-    qR_right.rho = d_fmax(qR_right.rho, EPS_RHO);
-    qR_right.p = d_fmax(qR_right.p, EPS_P);
-  }
-
-  Cons qL_left_cons = prim_to_cons(qL_left);
-  Cons qR_left_cons = prim_to_cons(qR_left);
-  Cons qL_right_cons = prim_to_cons(qL_right);
-  Cons qR_right_cons = prim_to_cons(qR_right);
-
-  Cons FxL = hllc_x(qL_left_cons, qR_left_cons);
-  Cons FxR = hllc_x(qL_right_cons, qR_right_cons);
-
-  // Y faces
-  Prim qB_bot, qT_bot;
-  {
-    if (y - 1 >= 0 && !mask[d_idx(x, y - 1)]) {
-      FacePrim fp = reconstruct_y(U, mask, x, y - 1);
-      Cons fpL = prim_to_cons(fp.L);
-      Cons fpR = prim_to_cons(fp.R);
-      Cons GBf = flux_y(fpR);
-      Cons GBb = flux_y(fpL);
-      qB_bot =
-          half_step_predict_y(fp.R, (GBf.rho - GBb.rho), (GBf.mx - GBb.mx),
-                              (GBf.my - GBb.my), (GBf.E - GBb.E), half_dt_dy);
-    } else {
-      qB_bot = cons_to_prim(neighbor_or_wall(U, mask, x, y, 0, -1));
-    }
-
-    qT_bot = half_step_predict_y(
-        fpCy.L, (fpCy_GR.rho - fpCy_GL.rho), (fpCy_GR.mx - fpCy_GL.mx),
-        (fpCy_GR.my - fpCy_GL.my), (fpCy_GR.E - fpCy_GL.E), half_dt_dy);
-
-    qB_bot.rho = d_fmax(qB_bot.rho, EPS_RHO);
-    qB_bot.p = d_fmax(qB_bot.p, EPS_P);
-    qT_bot.rho = d_fmax(qT_bot.rho, EPS_RHO);
-    qT_bot.p = d_fmax(qT_bot.p, EPS_P);
-  }
-
-  Prim qB_top, qT_top;
-  {
-    qB_top = half_step_predict_y(
-        fpCy.R, (fpCy_GR.rho - fpCy_GL.rho), (fpCy_GR.mx - fpCy_GL.mx),
-        (fpCy_GR.my - fpCy_GL.my), (fpCy_GR.E - fpCy_GL.E), half_dt_dy);
-
-    if (y + 1 < H && !mask[d_idx(x, y + 1)]) {
-      FacePrim fpN = reconstruct_y(U, mask, x, y + 1);
-      Cons fpNL = prim_to_cons(fpN.L);
-      Cons fpNR = prim_to_cons(fpN.R);
-      Cons NFf = flux_y(fpNR);
-      Cons NFb = flux_y(fpNL);
-      qT_top =
-          half_step_predict_y(fpN.L, (NFf.rho - NFb.rho), (NFf.mx - NFb.mx),
-                              (NFf.my - NFb.my), (NFf.E - NFb.E), half_dt_dy);
-    } else {
-      qT_top = cons_to_prim(neighbor_or_wall(U, mask, x, y, 0, +1));
-    }
-
-    qB_top.rho = d_fmax(qB_top.rho, EPS_RHO);
-    qB_top.p = d_fmax(qB_top.p, EPS_P);
-    qT_top.rho = d_fmax(qT_top.rho, EPS_RHO);
-    qT_top.p = d_fmax(qT_top.p, EPS_P);
-  }
-
-  Cons qB_bot_cons = prim_to_cons(qB_bot);
-  Cons qT_bot_cons = prim_to_cons(qT_bot);
-  Cons qB_top_cons = prim_to_cons(qB_top);
-  Cons qT_top_cons = prim_to_cons(qT_top);
-
-  Cons GyB = hllc_y(qB_bot_cons, qT_bot_cons);
-  Cons GyT = hllc_y(qB_top_cons, qT_top_cons);
+  Cons FxL = load_cons(xFlux, y * (W + 1) + x);
+  Cons FxR = load_cons(xFlux, y * (W + 1) + (x + 1));
+  Cons GyB = load_cons(yFlux, y * W + x);
+  Cons GyT = load_cons(yFlux, (y + 1) * W + x);
 
   // Hyperbolic update
   Cons Uc = load_cons(U, i);
@@ -1139,6 +1156,21 @@ static void free_Us(Usoa *U) {
   U->rho = U->mx = U->my = U->E = nullptr;
 }
 
+static void alloc_Cs(Csoa *A, int N) {
+  CK(cudaMalloc(&A->rho, N * sizeof(double)));
+  CK(cudaMalloc(&A->mx, N * sizeof(double)));
+  CK(cudaMalloc(&A->my, N * sizeof(double)));
+  CK(cudaMalloc(&A->E, N * sizeof(double)));
+}
+
+static void free_Cs(Csoa *A) {
+  cudaFree(A->rho);
+  cudaFree(A->mx);
+  cudaFree(A->my);
+  cudaFree(A->E);
+  A->rho = A->mx = A->my = A->E = nullptr;
+}
+
 static inline void swap_Us(Usoa *a, Usoa *b) {
   double *t;
   t = a->rho;
@@ -1304,6 +1336,15 @@ int main(int argc, char **argv) {
   alloc_Us(&dU, N);
   alloc_Us(&dUtmp, N);
 
+  Csoa dXStateL{}, dXStateR{}, dYStateL{}, dYStateR{};
+  Csoa dXFlux{}, dYFlux{};
+  alloc_Cs(&dXStateL, N);
+  alloc_Cs(&dXStateR, N);
+  alloc_Cs(&dYStateL, N);
+  alloc_Cs(&dYStateR, N);
+  alloc_Cs(&dXFlux, (W + 1) * H);
+  alloc_Cs(&dYFlux, W * (H + 1));
+
   uint8_t *dMask = nullptr;
   CK(cudaMalloc(&dMask, (size_t)N * sizeof(uint8_t)));
 
@@ -1315,6 +1356,10 @@ int main(int argc, char **argv) {
 
   const int threads = 256;
   const int blocksN = (N + threads - 1) / threads;
+  const int xFaceCount = (W + 1) * H;
+  const int yFaceCount = W * (H + 1);
+  const int blocksXFaces = (xFaceCount + threads - 1) / threads;
+  const int blocksYFaces = (yFaceCount + threads - 1) / threads;
 
   double *dBlockMin = nullptr;
   double *dBlockMax = nullptr;
@@ -1389,8 +1434,18 @@ int main(int argc, char **argv) {
         double half_dt_dx = 0.5 * dt_dx;
         double half_dt_dy = 0.5 * dt_dy;
 
-        k_step<<<blocksN, threads>>>(dU, dUtmp, dMask, dt, dt_dx, dt_dy,
-                                     half_dt_dx, half_dt_dy);
+        k_predict_face_states<<<blocksN, threads>>>(
+            dU, dMask, dXStateL, dXStateR, dYStateL, dYStateR, half_dt_dx,
+            half_dt_dy);
+        CK(cudaGetLastError());
+        k_compute_xface_flux<<<blocksXFaces, threads>>>(dU, dMask, dXStateL,
+                                                        dXStateR, dXFlux);
+        CK(cudaGetLastError());
+        k_compute_yface_flux<<<blocksYFaces, threads>>>(dU, dMask, dYStateL,
+                                                        dYStateR, dYFlux);
+        CK(cudaGetLastError());
+        k_step<<<blocksN, threads>>>(dU, dUtmp, dMask, dXFlux, dYFlux, dt,
+                                     dt_dx, dt_dy);
         CK(cudaGetLastError());
         CK(cudaDeviceSynchronize());
 
@@ -1471,6 +1526,13 @@ int main(int argc, char **argv) {
   cudaFree(dInvRange);
   cudaFree(dMaxSpeed);
   cudaFree(dBlockSpeedMax);
+
+  free_Cs(&dXStateL);
+  free_Cs(&dXStateR);
+  free_Cs(&dYStateL);
+  free_Cs(&dYStateR);
+  free_Cs(&dXFlux);
+  free_Cs(&dYFlux);
 
   free_Us(&dU);
   free_Us(&dUtmp);
