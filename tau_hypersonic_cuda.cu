@@ -270,6 +270,60 @@ __device__ __forceinline__ Cons neighbor_for_diff(const Usoa U,
   return load_cons(U, j);
 }
 
+struct TileView {
+  const double *rho;
+  const double *mx;
+  const double *my;
+  const double *E;
+  const uint8_t *mask;
+  int tileW;
+  int tileH;
+  int x0;
+  int y0;
+};
+
+__device__ __forceinline__ int tile_index(const TileView &tv, int lx, int ly) {
+  return ly * tv.tileW + lx;
+}
+
+__device__ __forceinline__ bool tile_contains(const TileView &tv, int x, int y) {
+  return x >= tv.x0 && x < (tv.x0 + tv.tileW) && y >= tv.y0 && y < (tv.y0 + tv.tileH);
+}
+
+__device__ __forceinline__ Cons tile_load_cons(const TileView &tv, int x, int y) {
+  int li = tile_index(tv, x - tv.x0, y - tv.y0);
+  return Cons{tv.rho[li], tv.mx[li], tv.my[li], tv.E[li]};
+}
+
+__device__ __forceinline__ uint8_t tile_load_mask(const TileView &tv, int x, int y) {
+  int li = tile_index(tv, x - tv.x0, y - tv.y0);
+  return tv.mask[li];
+}
+
+__device__ __forceinline__ Cons load_neighbor_or_wall_tiled(
+    const Usoa U, const uint8_t *mask, const TileView &tv,
+    const Prim &centerPrim, int xn, int yn) {
+  if (yn < 0)
+    yn = 0;
+  if (yn >= H)
+    yn = H - 1;
+
+  if (xn < 0) {
+    return prim_to_cons(inflow_state());
+  }
+  if (xn >= W) {
+    return load_cons(U, d_idx(W - 1, yn));
+  }
+
+  uint8_t m = tile_contains(tv, xn, yn) ? tile_load_mask(tv, xn, yn)
+                                        : mask[d_idx(xn, yn)];
+  if (m) {
+    return prim_to_cons(wall_ghost_prim(centerPrim));
+  }
+  return tile_contains(tv, xn, yn) ? tile_load_cons(tv, xn, yn)
+                                   : load_cons(U, d_idx(xn, yn));
+}
+
 __device__ __forceinline__ void enforce_positive_faces(Prim &qm, const Prim &qc,
                                                        Prim &qp) {
   for (int it = 0; it < 8; it++) {
@@ -767,13 +821,66 @@ __global__ void k_predict_face_states(Usoa U, const uint8_t *mask,
                                       Csoa yL_states, Csoa yR_states,
                                       double half_dt_dx,
                                       double half_dt_dy) {
-  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  constexpr int HALO = 1;
+  const int bdx = blockDim.x;
+  const int bdy = blockDim.y;
+  const int tileW = bdx + 2 * HALO;
+  const int tileH = bdy + 2 * HALO;
+  const int tileN = tileW * tileH;
+
+  extern __shared__ unsigned char smem[];
+  double *sRho = reinterpret_cast<double *>(smem);
+  double *sMx = sRho + tileN;
+  double *sMy = sMx + tileN;
+  double *sE = sMy + tileN;
+  uint8_t *sMask = reinterpret_cast<uint8_t *>(sE + tileN);
+
+  int tx = threadIdx.x;
+  int ty = threadIdx.y;
+  int x = (int)(blockIdx.x * bdx + tx);
+  int y = (int)(blockIdx.y * bdy + ty);
+
+  int x0 = (int)(blockIdx.x * bdx) - HALO;
+  int y0 = (int)(blockIdx.y * bdy) - HALO;
+
+  int tflat = ty * bdx + tx;
+  int tcount = bdx * bdy;
+  for (int t = tflat; t < tileN; t += tcount) {
+    int tlx = t % tileW;
+    int tly = t / tileW;
+    int gx = x0 + tlx;
+    int gy = y0 + tly;
+
+    int sx = gx;
+    int sy = gy;
+    if (sy < 0)
+      sy = 0;
+    if (sy >= H)
+      sy = H - 1;
+    if (sx < 0)
+      sx = 0;
+    if (sx >= W)
+      sx = W - 1;
+
+    int gi = d_idx(sx, sy);
+    Cons c = load_cons(U, gi);
+    sRho[t] = c.rho;
+    sMx[t] = c.mx;
+    sMy[t] = c.my;
+    sE[t] = c.E;
+    sMask[t] = mask[gi];
+  }
+  __syncthreads();
+
+  int i = d_idx(x, y);
   int N = W * H;
   if (i >= N)
     return;
 
+  TileView tv{sRho, sMx, sMy, sE, sMask, tileW, tileH, x0, y0};
+
   if (mask[i]) {
-    Cons Uc = load_cons(U, i);
+    Cons Uc = tile_load_cons(tv, x, y);
     store_cons(xL_states, i, Uc);
     store_cons(xR_states, i, Uc);
     store_cons(yL_states, i, Uc);
@@ -781,10 +888,37 @@ __global__ void k_predict_face_states(Usoa U, const uint8_t *mask,
     return;
   }
 
-  int x = i % W;
-  int y = i / W;
+  Cons Uc = tile_load_cons(tv, x, y);
+  Prim qc = cons_to_prim(Uc);
 
-  FacePrim fpCx = reconstruct_x(U, mask, x, y);
+  Cons Umx = load_neighbor_or_wall_tiled(U, mask, tv, qc, x - 1, y);
+  Cons Upx = load_neighbor_or_wall_tiled(U, mask, tv, qc, x + 1, y);
+  Prim qmX = cons_to_prim(Umx);
+  Prim qpX = cons_to_prim(Upx);
+
+  double dl_rho_x = qc.rho - qmX.rho, dr_rho_x = qpX.rho - qc.rho;
+  double dc_rho_x = 0.5 * (qpX.rho - qmX.rho);
+  double s_rho_x = mc_limiter(dl_rho_x, dc_rho_x, dr_rho_x);
+
+  double dl_u_x = qc.u - qmX.u, dr_u_x = qpX.u - qc.u;
+  double dc_u_x = 0.5 * (qpX.u - qmX.u);
+  double s_u_x = mc_limiter(dl_u_x, dc_u_x, dr_u_x);
+
+  double dl_v_x = qc.v - qmX.v, dr_v_x = qpX.v - qc.v;
+  double dc_v_x = 0.5 * (qpX.v - qmX.v);
+  double s_v_x = mc_limiter(dl_v_x, dc_v_x, dr_v_x);
+
+  double dl_p_x = qc.p - qmX.p, dr_p_x = qpX.p - qc.p;
+  double dc_p_x = 0.5 * (qpX.p - qmX.p);
+  double s_p_x = mc_limiter(dl_p_x, dc_p_x, dr_p_x);
+
+  FacePrim fpCx;
+  fpCx.L = Prim{qc.rho - 0.5 * s_rho_x, qc.u - 0.5 * s_u_x,
+                qc.v - 0.5 * s_v_x, qc.p - 0.5 * s_p_x};
+  fpCx.R = Prim{qc.rho + 0.5 * s_rho_x, qc.u + 0.5 * s_u_x,
+                qc.v + 0.5 * s_v_x, qc.p + 0.5 * s_p_x};
+  enforce_positive_faces(fpCx.L, qc, fpCx.R);
+
   Cons fpCx_L = prim_to_cons(fpCx.L);
   Cons fpCx_R = prim_to_cons(fpCx.R);
   Cons fpCx_FL = flux_x(fpCx_L);
@@ -803,7 +937,34 @@ __global__ void k_predict_face_states(Usoa U, const uint8_t *mask,
   store_cons(xL_states, i, prim_to_cons(qL));
   store_cons(xR_states, i, prim_to_cons(qR));
 
-  FacePrim fpCy = reconstruct_y(U, mask, x, y);
+  Cons Umy = load_neighbor_or_wall_tiled(U, mask, tv, qc, x, y - 1);
+  Cons Upy = load_neighbor_or_wall_tiled(U, mask, tv, qc, x, y + 1);
+  Prim qmY = cons_to_prim(Umy);
+  Prim qpY = cons_to_prim(Upy);
+
+  double dl_rho_y = qc.rho - qmY.rho, dr_rho_y = qpY.rho - qc.rho;
+  double dc_rho_y = 0.5 * (qpY.rho - qmY.rho);
+  double s_rho_y = mc_limiter(dl_rho_y, dc_rho_y, dr_rho_y);
+
+  double dl_u_y = qc.u - qmY.u, dr_u_y = qpY.u - qc.u;
+  double dc_u_y = 0.5 * (qpY.u - qmY.u);
+  double s_u_y = mc_limiter(dl_u_y, dc_u_y, dr_u_y);
+
+  double dl_v_y = qc.v - qmY.v, dr_v_y = qpY.v - qc.v;
+  double dc_v_y = 0.5 * (qpY.v - qmY.v);
+  double s_v_y = mc_limiter(dl_v_y, dc_v_y, dr_v_y);
+
+  double dl_p_y = qc.p - qmY.p, dr_p_y = qpY.p - qc.p;
+  double dc_p_y = 0.5 * (qpY.p - qmY.p);
+  double s_p_y = mc_limiter(dl_p_y, dc_p_y, dr_p_y);
+
+  FacePrim fpCy;
+  fpCy.L = Prim{qc.rho - 0.5 * s_rho_y, qc.u - 0.5 * s_u_y,
+                qc.v - 0.5 * s_v_y, qc.p - 0.5 * s_p_y};
+  fpCy.R = Prim{qc.rho + 0.5 * s_rho_y, qc.u + 0.5 * s_u_y,
+                qc.v + 0.5 * s_v_y, qc.p + 0.5 * s_p_y};
+  enforce_positive_faces(fpCy.L, qc, fpCy.R);
+
   Cons fpCy_L = prim_to_cons(fpCy.L);
   Cons fpCy_R = prim_to_cons(fpCy.R);
   Cons fpCy_GL = flux_y(fpCy_L);
@@ -893,18 +1054,68 @@ __global__ void k_compute_yface_flux(Usoa U, const uint8_t *mask,
 
 __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, Csoa xFlux,
                        Csoa yFlux, double dt, double dt_dx, double dt_dy) {
-  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  constexpr int HALO = 2;
+  const int bdx = blockDim.x;
+  const int bdy = blockDim.y;
+  const int tileW = bdx + 2 * HALO;
+  const int tileH = bdy + 2 * HALO;
+  const int tileN = tileW * tileH;
+
+  extern __shared__ unsigned char smem[];
+  double *sRho = reinterpret_cast<double *>(smem);
+  double *sMx = sRho + tileN;
+  double *sMy = sMx + tileN;
+  double *sE = sMy + tileN;
+  uint8_t *sMask = reinterpret_cast<uint8_t *>(sE + tileN);
+
+  int tx = threadIdx.x;
+  int ty = threadIdx.y;
+  int x = (int)(blockIdx.x * bdx + tx);
+  int y = (int)(blockIdx.y * bdy + ty);
+
+  int x0 = (int)(blockIdx.x * bdx) - HALO;
+  int y0 = (int)(blockIdx.y * bdy) - HALO;
+
+  int tflat = ty * bdx + tx;
+  int tcount = bdx * bdy;
+  for (int t = tflat; t < tileN; t += tcount) {
+    int tlx = t % tileW;
+    int tly = t / tileW;
+    int gx = x0 + tlx;
+    int gy = y0 + tly;
+
+    int sx = gx;
+    int sy = gy;
+    if (sy < 0)
+      sy = 0;
+    if (sy >= H)
+      sy = H - 1;
+    if (sx < 0)
+      sx = 0;
+    if (sx >= W)
+      sx = W - 1;
+
+    int gi = d_idx(sx, sy);
+    Cons c = load_cons(U, gi);
+    sRho[t] = c.rho;
+    sMx[t] = c.mx;
+    sMy[t] = c.my;
+    sE[t] = c.E;
+    sMask[t] = mask[gi];
+  }
+  __syncthreads();
+
+  int i = d_idx(x, y);
   int N = W * H;
   if (i >= N)
     return;
 
+  TileView tv{sRho, sMx, sMy, sE, sMask, tileW, tileH, x0, y0};
+
   if (mask[i]) {
-    store_cons(Uout, i, load_cons(U, i));
+    store_cons(Uout, i, tile_load_cons(tv, x, y));
     return;
   }
-
-  int x = i % W;
-  int y = i / W;
 
   Cons FxL = load_cons(xFlux, y * (W + 1) + x);
   Cons FxR = load_cons(xFlux, y * (W + 1) + (x + 1));
@@ -912,7 +1123,8 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, Csoa xFlux,
   Cons GyT = load_cons(yFlux, (y + 1) * W + x);
 
   // Hyperbolic update
-  Cons Uc = load_cons(U, i);
+  Cons Uc = tile_load_cons(tv, x, y);
+  Prim centerPrim = cons_to_prim(Uc);
   Cons Un = Uc;
 
   Un.rho -= dt_dx * (FxR.rho - FxL.rho);
@@ -929,10 +1141,10 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, Csoa xFlux,
   {
     const double inv12 = 1.0 / 12.0;
 
-    Cons xm2 = neighbor_for_diff(U, mask, x, y, x - 2, y);
-    Cons xm1 = neighbor_for_diff(U, mask, x, y, x - 1, y);
-    Cons xp1 = neighbor_for_diff(U, mask, x, y, x + 1, y);
-    Cons xp2 = neighbor_for_diff(U, mask, x, y, x + 2, y);
+    Cons xm2 = load_neighbor_or_wall_tiled(U, mask, tv, centerPrim, x - 2, y);
+    Cons xm1 = load_neighbor_or_wall_tiled(U, mask, tv, centerPrim, x - 1, y);
+    Cons xp1 = load_neighbor_or_wall_tiled(U, mask, tv, centerPrim, x + 1, y);
+    Cons xp2 = load_neighbor_or_wall_tiled(U, mask, tv, centerPrim, x + 2, y);
 
     double d2x_rho =
         (-xm2.rho + 16.0 * xm1.rho - 30.0 * Uc.rho + 16.0 * xp1.rho - xp2.rho) *
@@ -946,10 +1158,10 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, Csoa xFlux,
     double d2x_E =
         (-xm2.E + 16.0 * xm1.E - 30.0 * Uc.E + 16.0 * xp1.E - xp2.E) * inv12;
 
-    Cons ym2 = neighbor_for_diff(U, mask, x, y, x, y - 2);
-    Cons ym1 = neighbor_for_diff(U, mask, x, y, x, y - 1);
-    Cons yp1 = neighbor_for_diff(U, mask, x, y, x, y + 1);
-    Cons yp2 = neighbor_for_diff(U, mask, x, y, x, y + 2);
+    Cons ym2 = load_neighbor_or_wall_tiled(U, mask, tv, centerPrim, x, y - 2);
+    Cons ym1 = load_neighbor_or_wall_tiled(U, mask, tv, centerPrim, x, y - 1);
+    Cons yp1 = load_neighbor_or_wall_tiled(U, mask, tv, centerPrim, x, y + 1);
+    Cons yp2 = load_neighbor_or_wall_tiled(U, mask, tv, centerPrim, x, y + 2);
 
     double d2y_rho =
         (-ym2.rho + 16.0 * ym1.rho - 30.0 * Uc.rho + 16.0 * yp1.rho - yp2.rho) *
@@ -1374,6 +1586,18 @@ int main(int argc, char **argv) {
   const int blocksXFaces = (xFaceCount + threads - 1) / threads;
   const int blocksYFaces = (yFaceCount + threads - 1) / threads;
 
+  const dim3 tileBlock(32, 4);
+  const dim3 blocksNTiled((W + tileBlock.x - 1) / tileBlock.x,
+                          (H + tileBlock.y - 1) / tileBlock.y);
+  const size_t tileCellsPredict =
+      (size_t)(tileBlock.x + 2) * (size_t)(tileBlock.y + 2);
+  const size_t tileCellsStep =
+      (size_t)(tileBlock.x + 4) * (size_t)(tileBlock.y + 4);
+  const size_t shmPredict = 4 * tileCellsPredict * sizeof(double) +
+                            tileCellsPredict * sizeof(uint8_t);
+  const size_t shmStep = 4 * tileCellsStep * sizeof(double) +
+                         tileCellsStep * sizeof(uint8_t);
+
   double *dBlockMin = nullptr;
   double *dBlockMax = nullptr;
   CK(cudaMalloc(&dBlockMin, (size_t)blocksN * sizeof(double)));
@@ -1447,7 +1671,7 @@ int main(int argc, char **argv) {
         double half_dt_dx = 0.5 * dt_dx;
         double half_dt_dy = 0.5 * dt_dy;
 
-        k_predict_face_states<<<blocksN, threads>>>(
+        k_predict_face_states<<<blocksNTiled, tileBlock, shmPredict>>>(
             dU, dMask, dXStateL, dXStateR, dYStateL, dYStateR, half_dt_dx,
             half_dt_dy);
         CK(cudaGetLastError());
@@ -1457,8 +1681,9 @@ int main(int argc, char **argv) {
         k_compute_yface_flux<<<blocksYFaces, threads>>>(dU, dMask, dYStateL,
                                                         dYStateR, dYFlux);
         CK(cudaGetLastError());
-        k_step<<<blocksN, threads>>>(dU, dUtmp, dMask, dXFlux, dYFlux, dt,
-                                     dt_dx, dt_dy);
+        k_step<<<blocksNTiled, tileBlock, shmStep>>>(dU, dUtmp, dMask,
+                                                dXFlux, dYFlux, dt, dt_dx,
+                                                dt_dy);
         CK(cudaGetLastError());
 
         // Ping-pong swap (removes k_copy full-grid copy)
