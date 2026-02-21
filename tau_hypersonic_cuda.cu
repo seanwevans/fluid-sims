@@ -1156,6 +1156,17 @@ static void free_Us(Usoa *U) {
   U->rho = U->mx = U->my = U->E = nullptr;
 }
 
+static void free_cuda_ptr(void **ptr) {
+  if (!ptr || !*ptr)
+    return;
+  cudaError_t e = cudaFree(*ptr);
+  if (e != cudaSuccess) {
+    fprintf(stderr, "CUDA warning during cleanup: cudaFree failed: %s\n",
+            cudaGetErrorString(e));
+  }
+  *ptr = nullptr;
+}
+
 static void alloc_Cs(Csoa *A, int N) {
   CK(cudaMalloc(&A->rho, N * sizeof(double)));
   CK(cudaMalloc(&A->mx, N * sizeof(double)));
@@ -1512,30 +1523,37 @@ int main(int argc, char **argv) {
     EndDrawing();
   }
 
-  CloseWindow();
+  // Deterministic cleanup in reverse allocation order.
+  free_cuda_ptr((void **)&dBlockSpeedMax);
+  free_cuda_ptr((void **)&dMaxSpeed);
+  free_cuda_ptr((void **)&dInvRange);
+  free_cuda_ptr((void **)&dReduceMax);
+  free_cuda_ptr((void **)&dReduceMin);
+  free_cuda_ptr((void **)&dBlockMax);
+  free_cuda_ptr((void **)&dBlockMin);
+  free_cuda_ptr((void **)&dPixels);
+  free_cuda_ptr((void **)&dTmpVal);
+  free_cuda_ptr((void **)&dMask);
 
+  free_Cs(&dYFlux);
+  free_Cs(&dXFlux);
+  free_Cs(&dYStateR);
+  free_Cs(&dYStateL);
+  free_Cs(&dXStateR);
+  free_Cs(&dXStateL);
+
+  free_Us(&dUtmp);
+  free_Us(&dU);
+
+  UnloadTexture(tex);
+  CloseWindow();
   free(pixels);
 
-  cudaFree(dMask);
-  cudaFree(dTmpVal);
-  cudaFree(dPixels);
-  cudaFree(dBlockMin);
-  cudaFree(dBlockMax);
-  cudaFree(dReduceMin);
-  cudaFree(dReduceMax);
-  cudaFree(dInvRange);
-  cudaFree(dMaxSpeed);
-  cudaFree(dBlockSpeedMax);
-
-  free_Cs(&dXStateL);
-  free_Cs(&dXStateR);
-  free_Cs(&dYStateL);
-  free_Cs(&dYStateR);
-  free_Cs(&dXFlux);
-  free_Cs(&dYFlux);
-
-  free_Us(&dU);
-  free_Us(&dUtmp);
+  cudaError_t reset_err = cudaDeviceReset();
+  if (reset_err != cudaSuccess) {
+    fprintf(stderr, "CUDA warning during cleanup: cudaDeviceReset failed: %s\n",
+            cudaGetErrorString(reset_err));
+  }
 
   return 0;
 }
