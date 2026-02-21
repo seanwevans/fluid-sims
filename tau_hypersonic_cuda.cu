@@ -63,7 +63,8 @@ static void validate_reduction_launch_config(int threads,
                                              size_t shared_bytes_per_array) {
   if (threads <= 0 || (threads & (threads - 1)) != 0) {
     fprintf(stderr,
-            "Invalid thread count %d: reductions require a positive power-of-two block size.\n",
+            "Invalid thread count %d: reductions require a positive "
+            "power-of-two block size.\n",
             threads);
     exit(1);
   }
@@ -83,7 +84,8 @@ static void validate_reduction_launch_config(int threads,
   size_t shared_bytes = shared_bytes_per_array * (size_t)threads;
   if (shared_bytes > prop.sharedMemPerBlock) {
     fprintf(stderr,
-            "Invalid shared memory request %zu bytes: device sharedMemPerBlock is %zu bytes.\n",
+            "Invalid shared memory request %zu bytes: device sharedMemPerBlock "
+            "is %zu bytes.\n",
             shared_bytes, (size_t)prop.sharedMemPerBlock);
     exit(1);
   }
@@ -174,8 +176,7 @@ __device__ __forceinline__ double prim_tangent(const Prim &p) {
   return p.u;
 }
 
-template <Axis AX>
-__device__ __forceinline__ Cons flux_axis(Cons c) {
+template <Axis AX> __device__ __forceinline__ Cons flux_axis(Cons c) {
   Prim p = cons_to_prim(c);
   Cons f;
   double un = prim_normal<AX>(p);
@@ -186,8 +187,7 @@ __device__ __forceinline__ Cons flux_axis(Cons c) {
   return f;
 }
 
-template <Axis AX>
-__device__ __forceinline__ Cons flux_axis(Prim p) {
+template <Axis AX> __device__ __forceinline__ Cons flux_axis(Prim p) {
   return flux_axis<AX>(prim_to_cons(p));
 }
 
@@ -272,7 +272,8 @@ __device__ __forceinline__ Cons neighbor_or_wall(const Usoa U,
 
   int j = d_idx(xn, yn);
   if (mask[j]) {
-    return prim_to_cons(wall_ghost_prim(cons_to_prim(load_cons(U, d_idx(x, y)))));
+    return prim_to_cons(
+        wall_ghost_prim(cons_to_prim(load_cons(U, d_idx(x, y)))));
   }
   return load_cons(U, j);
 }
@@ -316,16 +317,20 @@ __device__ __forceinline__ int tile_index(const TileView &tv, int lx, int ly) {
   return ly * tv.tileW + lx;
 }
 
-__device__ __forceinline__ bool tile_contains(const TileView &tv, int x, int y) {
-  return x >= tv.x0 && x < (tv.x0 + tv.tileW) && y >= tv.y0 && y < (tv.y0 + tv.tileH);
+__device__ __forceinline__ bool tile_contains(const TileView &tv, int x,
+                                              int y) {
+  return x >= tv.x0 && x < (tv.x0 + tv.tileW) && y >= tv.y0 &&
+         y < (tv.y0 + tv.tileH);
 }
 
-__device__ __forceinline__ Cons tile_load_cons(const TileView &tv, int x, int y) {
+__device__ __forceinline__ Cons tile_load_cons(const TileView &tv, int x,
+                                               int y) {
   int li = tile_index(tv, x - tv.x0, y - tv.y0);
   return Cons{tv.rho[li], tv.mx[li], tv.my[li], tv.E[li]};
 }
 
-__device__ __forceinline__ uint8_t tile_load_mask(const TileView &tv, int x, int y) {
+__device__ __forceinline__ uint8_t tile_load_mask(const TileView &tv, int x,
+                                                  int y) {
   int li = tile_index(tv, x - tv.x0, y - tv.y0);
   return tv.mask[li];
 }
@@ -409,15 +414,17 @@ __device__ __forceinline__ FacePrim reconstruct_limited_faces(const Prim &qm,
 }
 
 template <Axis AX>
-__device__ __forceinline__ FacePrim reconstruct_axis_tiled(
-    const Usoa U, const uint8_t *mask, const TileView &tv, const Prim &qc,
-    int x, int y) {
+__device__ __forceinline__ FacePrim reconstruct_axis_tiled(const Usoa U,
+                                                           const uint8_t *mask,
+                                                           const TileView &tv,
+                                                           const Prim &qc,
+                                                           int x, int y) {
   constexpr int DX = (AX == Axis::X) ? 1 : 0;
   constexpr int DY = (AX == Axis::X) ? 0 : 1;
-  Prim qm = cons_to_prim(load_neighbor_or_wall_tiled(U, mask, tv, qc, x - DX,
-                                                     y - DY));
-  Prim qp = cons_to_prim(load_neighbor_or_wall_tiled(U, mask, tv, qc, x + DX,
-                                                     y + DY));
+  Prim qm = cons_to_prim(
+      load_neighbor_or_wall_tiled(U, mask, tv, qc, x - DX, y - DY));
+  Prim qp = cons_to_prim(
+      load_neighbor_or_wall_tiled(U, mask, tv, qc, x + DX, y + DY));
   return reconstruct_limited_faces(qm, qc, qp);
 }
 
@@ -440,16 +447,16 @@ __device__ __forceinline__ Prim half_step_predict_x(Prim q, double dF_rho,
                                                     double dF_mx, double dF_my,
                                                     double dF_E,
                                                     double half_dt_dx) {
-  return half_step_predict_axis<Axis::X>(
-      q, Cons{dF_rho, dF_mx, dF_my, dF_E}, half_dt_dx);
+  return half_step_predict_axis<Axis::X>(q, Cons{dF_rho, dF_mx, dF_my, dF_E},
+                                         half_dt_dx);
 }
 
 __device__ __forceinline__ Prim half_step_predict_y(Prim q, double dG_rho,
                                                     double dG_mx, double dG_my,
                                                     double dG_E,
                                                     double half_dt_dy) {
-  return half_step_predict_axis<Axis::Y>(
-      q, Cons{dG_rho, dG_mx, dG_my, dG_E}, half_dt_dy);
+  return half_step_predict_axis<Axis::Y>(q, Cons{dG_rho, dG_mx, dG_my, dG_E},
+                                         half_dt_dy);
 }
 
 __device__ __forceinline__ Cons cons_sub(Cons a, Cons b) {
@@ -462,8 +469,7 @@ __device__ __forceinline__ Cons cons_mul(double s, Cons a) {
   return Cons{s * a.rho, s * a.mx, s * a.my, s * a.E};
 }
 
-template <Axis AX>
-__device__ __forceinline__ Cons hlle_axis(Cons UL, Cons UR) {
+template <Axis AX> __device__ __forceinline__ Cons hlle_axis(Cons UL, Cons UR) {
   Prim L = cons_to_prim(UL);
   Prim R = cons_to_prim(UR);
   double uL = prim_normal<AX>(L);
@@ -499,8 +505,7 @@ __device__ __forceinline__ Cons hlle_y(Cons UL, Cons UR) {
   return hlle_axis<Axis::Y>(UL, UR);
 }
 
-template <Axis AX>
-__device__ __forceinline__ Cons hllc_axis(Cons UL, Cons UR) {
+template <Axis AX> __device__ __forceinline__ Cons hllc_axis(Cons UL, Cons UR) {
   Prim L = cons_to_prim(UL);
   Prim R = cons_to_prim(UR);
 
@@ -560,9 +565,8 @@ __device__ __forceinline__ Cons hllc_axis(Cons UL, Cons UR) {
   double EStarL = ((SL - unL) * EL - pL * unL + pStar * SM) / dLS;
   if (!isfinite(EStarL))
     return hlle_axis<AX>(UL, UR);
-  Cons UStarL = (AX == Axis::X)
-                    ? Cons{rhoStarL, momNL, momTL, EStarL}
-                    : Cons{rhoStarL, momTL, momNL, EStarL};
+  Cons UStarL = (AX == Axis::X) ? Cons{rhoStarL, momNL, momTL, EStarL}
+                                : Cons{rhoStarL, momTL, momNL, EStarL};
 
   double momNR = rhoStarR * SM;
   double momTR = rhoStarR * utR;
@@ -570,9 +574,8 @@ __device__ __forceinline__ Cons hllc_axis(Cons UL, Cons UR) {
   double EStarR = ((SR - unR) * ER - pR * unR + pStar * SM) / dRS;
   if (!isfinite(EStarR))
     return hlle_axis<AX>(UL, UR);
-  Cons UStarR = (AX == Axis::X)
-                    ? Cons{rhoStarR, momNR, momTR, EStarR}
-                    : Cons{rhoStarR, momTR, momNR, EStarR};
+  Cons UStarR = (AX == Axis::X) ? Cons{rhoStarR, momNR, momTR, EStarR}
+                                : Cons{rhoStarR, momTR, momNR, EStarR};
 
   if (SM >= 0.0) {
     Cons F;
@@ -837,8 +840,7 @@ __global__ void k_reduce_block_max(const double *blockMax, int nBlocks,
 __global__ void k_predict_face_states(Usoa U, const uint8_t *mask,
                                       Csoa xL_states, Csoa xR_states,
                                       Csoa yL_states, Csoa yR_states,
-                                      double half_dt_dx,
-                                      double half_dt_dy) {
+                                      double half_dt_dx, double half_dt_dy) {
   constexpr int HALO = 1;
   const int bdx = blockDim.x;
   const int bdy = blockDim.y;
@@ -1406,7 +1408,8 @@ static void print_usage(const char *argv0) {
           argv0);
 }
 
-static bool parse_double_flag(const char *name, const char *value, double *out) {
+static bool parse_double_flag(const char *name, const char *value,
+                              double *out) {
   char *end = nullptr;
   double v = strtod(value, &end);
   if (!end || *end != '\0' || !isfinite(v)) {
@@ -1502,18 +1505,19 @@ static bool parse_args(int argc, char **argv, SimConfig *cfg) {
     return false;
   }
   if (cfg->steps_per_frame <= 0 || cfg->steps_per_frame > max_steps_per_frame) {
-    fprintf(stderr,
-            "Invalid --steps-per-frame: %d (must be in [1, %d]).\n",
+    fprintf(stderr, "Invalid --steps-per-frame: %d (must be in [1, %d]).\n",
             cfg->steps_per_frame, max_steps_per_frame);
     return false;
   }
 
   if (!isfinite(cfg->geom_x0)) {
-    fprintf(stderr, "Invalid --geom-x0: %.8g (must be finite).\n", cfg->geom_x0);
+    fprintf(stderr, "Invalid --geom-x0: %.8g (must be finite).\n",
+            cfg->geom_x0);
     return false;
   }
   if (!isfinite(cfg->geom_cy)) {
-    fprintf(stderr, "Invalid --geom-cy: %.8g (must be finite).\n", cfg->geom_cy);
+    fprintf(stderr, "Invalid --geom-cy: %.8g (must be finite).\n",
+            cfg->geom_cy);
     return false;
   }
   if (cfg->geom_Rb <= 0.0) {
@@ -1525,8 +1529,7 @@ static bool parse_args(int argc, char **argv, SimConfig *cfg) {
     return false;
   }
   if (cfg->geom_theta <= 0.0 || cfg->geom_theta >= 0.5 * kPi) {
-    fprintf(stderr,
-            "Invalid --geom-theta: %.8g (must be in (0, pi/2)).\n",
+    fprintf(stderr, "Invalid --geom-theta: %.8g (must be in (0, pi/2)).\n",
             cfg->geom_theta);
     return false;
   }
@@ -1581,8 +1584,9 @@ static void print_config(const SimConfig &cfg) {
   printf("  visc_e=%.8g\n", cfg.visc_e);
   printf("  inflow_mach=%.8g\n", cfg.inflow_mach);
   printf("  steps_per_frame=%d\n", cfg.steps_per_frame);
-  printf("  geom_x0=%.8g geom_cy=%.8g geom_Rb=%.8g geom_Rn=%.8g geom_theta=%.8g\n",
-         cfg.geom_x0, cfg.geom_cy, cfg.geom_Rb, cfg.geom_Rn, cfg.geom_theta);
+  printf(
+      "  geom_x0=%.8g geom_cy=%.8g geom_Rb=%.8g geom_Rn=%.8g geom_theta=%.8g\n",
+      cfg.geom_x0, cfg.geom_cy, cfg.geom_Rb, cfg.geom_Rn, cfg.geom_theta);
 }
 
 #ifndef TAU_HYPERSONIC_CUDA_NO_MAIN
@@ -1651,8 +1655,8 @@ int main(int argc, char **argv) {
       (size_t)(tileBlock.x + 4) * (size_t)(tileBlock.y + 4);
   const size_t shmPredict = 4 * tileCellsPredict * sizeof(double) +
                             tileCellsPredict * sizeof(uint8_t);
-  const size_t shmStep = 4 * tileCellsStep * sizeof(double) +
-                         tileCellsStep * sizeof(uint8_t);
+  const size_t shmStep =
+      4 * tileCellsStep * sizeof(double) + tileCellsStep * sizeof(uint8_t);
 
   double *dBlockMin = nullptr;
   double *dBlockMax = nullptr;
@@ -1710,8 +1714,8 @@ int main(int argc, char **argv) {
         k_max_wavespeed_blocks<<<blocksN, threads, reduceSharedBytes>>>(
             dU, dMask, dBlockSpeedMax);
         CK(cudaGetLastError());
-        k_reduce_block_max<<<1, threads, reduceSharedBytes>>>(dBlockSpeedMax,
-                                                        blocksN, dMaxSpeed);
+        k_reduce_block_max<<<1, threads, reduceSharedBytes>>>(
+            dBlockSpeedMax, blocksN, dMaxSpeed);
         CK(cudaGetLastError());
 
         CK(cudaEventRecord(dt_ready_event));
@@ -1749,9 +1753,8 @@ int main(int argc, char **argv) {
         k_compute_yface_flux<<<blocksYFaces, threads>>>(dU, dMask, dYStateL,
                                                         dYStateR, dYFlux);
         CK(cudaGetLastError());
-        k_step<<<blocksNTiled, tileBlock, shmStep>>>(dU, dUtmp, dMask,
-                                                dXFlux, dYFlux, dt, dt_dx,
-                                                dt_dy);
+        k_step<<<blocksNTiled, tileBlock, shmStep>>>(dU, dUtmp, dMask, dXFlux,
+                                                     dYFlux, dt, dt_dx, dt_dy);
         CK(cudaGetLastError());
 
         // Ping-pong swap (removes k_copy full-grid copy)
