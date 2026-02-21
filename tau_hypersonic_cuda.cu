@@ -1,7 +1,6 @@
 // tau_hypersonic_cuda.cu
 //
 // nvcc -O3 -o tau_2d_hypersonic_cuda tau_hypersonic_cuda.cu -std=c++17 -lraylib
-// --use_fast_math
 //
 // Controls: SPACE pause, R reset, M mode
 //
@@ -43,7 +42,6 @@ static inline void ck(cudaError_t e, const char *msg) {
     exit(1);
   }
 }
-
 #define CK(x) ck((x), #x)
 
 typedef struct {
@@ -71,20 +69,8 @@ __device__ __forceinline__ double d_fmin(double a, double b) {
   return a < b ? a : b;
 }
 __device__ __forceinline__ double d_fabs(double a) { return a < 0 ? -a : a; }
-
-// Warp reduction primitives
-__device__ __forceinline__ double warp_reduce_max(double val) {
-  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
-    val = d_fmax(val, __shfl_down_sync(0xffffffff, val, offset));
-  }
-  return val;
-}
-
-__device__ __forceinline__ double warp_reduce_min(double val) {
-  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
-    val = d_fmin(val, __shfl_down_sync(0xffffffff, val, offset));
-  }
-  return val;
+__device__ __forceinline__ double d_isfinite(double x) {
+  return isfinite(x) ? 1.0 : 0.0;
 }
 
 // prims and cons
@@ -110,7 +96,6 @@ __device__ __forceinline__ Cons prim_to_cons(Prim p) {
   Cons c;
   double rho = d_fmax(p.rho, EPS_RHO);
   double pr = d_fmax(p.p, EPS_P);
-
   c.rho = rho;
   c.mx = rho * p.u;
   c.my = rho * p.v;
@@ -193,15 +178,17 @@ __device__ __forceinline__ Cons neighbor_or_wall(const Usoa U,
   if (yn >= H)
     yn = H - 1;
 
-  if (xn < 0)
+  if (xn < 0) {
     return prim_to_cons(inflow_state());
-  if (xn >= W)
+  }
+  if (xn >= W) {
     return load_cons(U, d_idx(W - 1, yn));
+  }
 
   int j = d_idx(xn, yn);
-  if (mask[j])
+  if (mask[j]) {
     return reflect_noslip(load_cons(U, d_idx(x, y)));
-
+  }
   return load_cons(U, j);
 }
 
@@ -213,15 +200,17 @@ __device__ __forceinline__ Cons neighbor_for_diff(const Usoa U,
   if (yn >= H)
     yn = H - 1;
 
-  if (xn < 0)
+  if (xn < 0) {
     return prim_to_cons(inflow_state());
-  if (xn >= W)
+  }
+  if (xn >= W) {
     return load_cons(U, d_idx(W - 1, yn));
+  }
 
   int j = d_idx(xn, yn);
-  if (mask[j])
+  if (mask[j]) {
     return reflect_noslip(load_cons(U, d_idx(xc, yc)));
-
+  }
   return load_cons(U, j);
 }
 
@@ -354,6 +343,69 @@ __device__ __forceinline__ Prim half_step_predict_y(Prim q, double dG_rho,
   return out;
 }
 
+__device__ __forceinline__ Cons cons_sub(Cons a, Cons b) {
+  return Cons{a.rho - b.rho, a.mx - b.mx, a.my - b.my, a.E - b.E};
+}
+__device__ __forceinline__ Cons cons_add(Cons a, Cons b) {
+  return Cons{a.rho + b.rho, a.mx + b.mx, a.my + b.my, a.E + b.E};
+}
+__device__ __forceinline__ Cons cons_mul(double s, Cons a) {
+  return Cons{s * a.rho, s * a.mx, s * a.my, s * a.E};
+}
+
+__device__ __forceinline__ Cons hlle_x(Cons UL, Cons UR) {
+  Prim L = cons_to_prim(UL);
+  Prim R = cons_to_prim(UR);
+  double aL = sound_speed(L);
+  double aR = sound_speed(R);
+  double SL = d_fmin(L.u - aL, R.u - aR);
+  double SR = d_fmax(L.u + aL, R.u + aR);
+
+  Cons FL = flux_x(UL);
+  Cons FR = flux_x(UR);
+
+  if (SL >= 0.0)
+    return FL;
+  if (SR <= 0.0)
+    return FR;
+
+  double denom = SR - SL;
+  if (d_fabs(denom) < 1e-14)
+    return cons_mul(0.5, cons_add(FL, FR));
+
+  // F = (SR*FL - SL*FR + SL*SR*(UR-UL)) / (SR-SL)
+  Cons term1 = cons_mul(SR, FL);
+  Cons term2 = cons_mul(-SL, FR);
+  Cons term3 = cons_mul(SL * SR, cons_sub(UR, UL));
+  return cons_mul(1.0 / denom, cons_add(cons_add(term1, term2), term3));
+}
+
+__device__ __forceinline__ Cons hlle_y(Cons UL, Cons UR) {
+  Prim L = cons_to_prim(UL);
+  Prim R = cons_to_prim(UR);
+  double aL = sound_speed(L);
+  double aR = sound_speed(R);
+  double SL = d_fmin(L.v - aL, R.v - aR);
+  double SR = d_fmax(L.v + aL, R.v + aR);
+
+  Cons FL = flux_y(UL);
+  Cons FR = flux_y(UR);
+
+  if (SL >= 0.0)
+    return FL;
+  if (SR <= 0.0)
+    return FR;
+
+  double denom = SR - SL;
+  if (d_fabs(denom) < 1e-14)
+    return cons_mul(0.5, cons_add(FL, FR));
+
+  Cons term1 = cons_mul(SR, FL);
+  Cons term2 = cons_mul(-SL, FR);
+  Cons term3 = cons_mul(SL * SR, cons_sub(UR, UL));
+  return cons_mul(1.0 / denom, cons_add(cons_add(term1, term2), term3));
+}
+
 __device__ __forceinline__ Cons hllc_x(Cons UL, Cons UR) {
   Prim L = cons_to_prim(UL);
   Prim R = cons_to_prim(UR);
@@ -378,23 +430,46 @@ __device__ __forceinline__ Cons hllc_x(Cons UL, Cons UR) {
 
   double num = pR - pL + rhoL * uL * (SL - uL) - rhoR * uR * (SR - uR);
   double den = rhoL * (SL - uL) - rhoR * (SR - uR);
+
+  if (d_fabs(den) < 1e-14 || !isfinite(num) || !isfinite(den)) {
+    return hlle_x(UL, UR);
+  }
+
   double SM = num / den;
+  if (!isfinite(SM))
+    return hlle_x(UL, UR);
 
   double pStar = pL + rhoL * (SL - uL) * (SM - uL);
   pStar = d_fmax(pStar, EPS_P);
 
-  double rhoStarL = rhoL * (SL - uL) / (SL - SM);
+  double dLS = (SL - SM);
+  double dRS = (SR - SM);
+  if (d_fabs(dLS) < 1e-14 || d_fabs(dRS) < 1e-14) {
+    return hlle_x(UL, UR);
+  }
+
+  double rhoStarL = rhoL * (SL - uL) / dLS;
+  double rhoStarR = rhoR * (SR - uR) / dRS;
+
+  if (!(rhoStarL > 0.0) || !(rhoStarR > 0.0) || !isfinite(rhoStarL) ||
+      !isfinite(rhoStarR)) {
+    return hlle_x(UL, UR);
+  }
+
   double mxStarL = rhoStarL * SM;
   double myStarL = rhoStarL * L.v;
   double EL = UL.E;
-  double EStarL = ((SL - uL) * EL - pL * uL + pStar * SM) / (SL - SM);
+  double EStarL = ((SL - uL) * EL - pL * uL + pStar * SM) / dLS;
+  if (!isfinite(EStarL))
+    return hlle_x(UL, UR);
   Cons UStarL{rhoStarL, mxStarL, myStarL, EStarL};
 
-  double rhoStarR = rhoR * (SR - uR) / (SR - SM);
   double mxStarR = rhoStarR * SM;
   double myStarR = rhoStarR * R.v;
   double ER = UR.E;
-  double EStarR = ((SR - uR) * ER - pR * uR + pStar * SM) / (SR - SM);
+  double EStarR = ((SR - uR) * ER - pR * uR + pStar * SM) / dRS;
+  if (!isfinite(EStarR))
+    return hlle_x(UL, UR);
   Cons UStarR{rhoStarR, mxStarR, myStarR, EStarR};
 
   if (SM >= 0.0) {
@@ -438,23 +513,46 @@ __device__ __forceinline__ Cons hllc_y(Cons UL, Cons UR) {
 
   double num = pR - pL + rhoL * vL * (SL - vL) - rhoR * vR * (SR - vR);
   double den = rhoL * (SL - vL) - rhoR * (SR - vR);
+
+  if (d_fabs(den) < 1e-14 || !isfinite(num) || !isfinite(den)) {
+    return hlle_y(UL, UR);
+  }
+
   double SM = num / den;
+  if (!isfinite(SM))
+    return hlle_y(UL, UR);
 
   double pStar = pL + rhoL * (SL - vL) * (SM - vL);
   pStar = d_fmax(pStar, EPS_P);
 
-  double rhoStarL = rhoL * (SL - vL) / (SL - SM);
+  double dLS = (SL - SM);
+  double dRS = (SR - SM);
+  if (d_fabs(dLS) < 1e-14 || d_fabs(dRS) < 1e-14) {
+    return hlle_y(UL, UR);
+  }
+
+  double rhoStarL = rhoL * (SL - vL) / dLS;
+  double rhoStarR = rhoR * (SR - vR) / dRS;
+
+  if (!(rhoStarL > 0.0) || !(rhoStarR > 0.0) || !isfinite(rhoStarL) ||
+      !isfinite(rhoStarR)) {
+    return hlle_y(UL, UR);
+  }
+
   double mxStarL = rhoStarL * L.u;
   double myStarL = rhoStarL * SM;
   double EL = UL.E;
-  double EStarL = ((SL - vL) * EL - pL * vL + pStar * SM) / (SL - SM);
+  double EStarL = ((SL - vL) * EL - pL * vL + pStar * SM) / dLS;
+  if (!isfinite(EStarL))
+    return hlle_y(UL, UR);
   Cons UStarL{rhoStarL, mxStarL, myStarL, EStarL};
 
-  double rhoStarR = rhoR * (SR - vR) / (SR - SM);
   double mxStarR = rhoStarR * R.u;
   double myStarR = rhoStarR * SM;
   double ER = UR.E;
-  double EStarR = ((SR - vR) * ER - pR * vR + pStar * SM) / (SR - SM);
+  double EStarR = ((SR - vR) * ER - pR * vR + pStar * SM) / dRS;
+  if (!isfinite(EStarR))
+    return hlle_y(UL, UR);
   Cons UStarR{rhoStarR, mxStarR, myStarR, EStarR};
 
   if (SM >= 0.0) {
@@ -474,9 +572,11 @@ __device__ __forceinline__ Cons hllc_y(Cons UL, Cons UR) {
   }
 }
 
+// device helpers
 __device__ __forceinline__ double clamp01(double t) {
   return t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
 }
+
 __device__ __forceinline__ double len2(double x, double y) {
   return sqrt(x * x + y * y);
 }
@@ -495,10 +595,14 @@ __device__ __forceinline__ double sdSegment(double px, double py, double ax,
 __device__ __forceinline__ double
 sdSphereConeCapsule(double x, double y, double Rb, double Rn, double theta) {
   double r = d_fabs(y);
-  double st = sin(theta), ct = cos(theta), tt = tan(theta);
+
+  double st = sin(theta);
+  double ct = cos(theta);
+  double tt = tan(theta);
 
   double xt = Rn * (1.0 - st);
   double rt = Rn * ct;
+
   double xb = xt + (Rb - rt) / d_fmax(tt, 1e-30);
 
   double rprof = 0.0;
@@ -560,8 +664,10 @@ __device__ __forceinline__ Prim sample_prim_bc(const Usoa U,
 
   if (x < 0)
     return inflow_state();
-  if (x >= W)
-    return cons_to_prim(load_cons(U, d_idx(W - 1, y)));
+  if (x >= W) {
+    int i = d_idx(W - 1, y);
+    return cons_to_prim(load_cons(U, i));
+  }
 
   int i = d_idx(x, y);
   if (mask[i]) {
@@ -581,9 +687,11 @@ __device__ __forceinline__ double spherecone_xb(double Rb, double Rn,
   return xt + (Rb - rt) / d_fmax(tt, 1e-30);
 }
 
+// k_*
 __global__ void k_init(Usoa U, uint8_t *mask) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= W * H)
+  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  int N = W * H;
+  if (i >= N)
     return;
 
   int x = i % W;
@@ -613,7 +721,7 @@ __global__ void k_init(Usoa U, uint8_t *mask) {
 }
 
 __global__ void k_apply_inflow_left(Usoa U, const uint8_t *mask) {
-  int y = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = (int)(blockIdx.x * blockDim.x + threadIdx.x);
   if (y >= H)
     return;
 
@@ -622,47 +730,66 @@ __global__ void k_apply_inflow_left(Usoa U, const uint8_t *mask) {
     return;
 
   Prim infl = inflow_state();
-  store_cons(U, i0, prim_to_cons(infl));
+  Prim pin{infl.rho, infl.u, infl.v, infl.p};
+  store_cons(U, i0, prim_to_cons(pin));
 }
 
-__global__ void k_max_wavespeed(const Usoa U, const uint8_t *mask,
-                                double *blockMax) {
+// Atomic max for positive doubles (bitwise monotonic for positive values)
+__device__ __forceinline__ void atomicMaxDoublePos(double *addr, double v) {
+  unsigned long long *uaddr = (unsigned long long *)addr;
+  unsigned long long old = *uaddr;
+  unsigned long long val = __double_as_longlong(v);
+  // only valid for v >= 0 and all stored values >= 0
+  while (old < val) {
+    unsigned long long prev = atomicCAS(uaddr, old, val);
+    if (prev == old)
+      break;
+    old = prev;
+  }
+}
+
+__global__ void k_max_wavespeed_atomic(const Usoa U, const uint8_t *mask,
+                                       double *outMax) {
   __shared__ double smax[256];
   int tid = threadIdx.x;
-  int i = blockIdx.x * blockDim.x + tid;
+  int N = W * H;
 
+  int i = (int)(blockIdx.x * blockDim.x + tid);
   double v = 1e-12;
-  if (i < W * H && !mask[i]) {
+
+  if (i < N && !mask[i]) {
     Prim p = cons_to_prim(load_cons(U, i));
     double a = sound_speed(p);
     double sx = d_fabs(p.u) + a;
     double sy = d_fabs(p.v) + a;
-    v = d_fmax(sx, sy);
+    v = (sx > sy) ? sx : sy;
+    if (!isfinite(v))
+      v = 1e-12;
   }
+
   smax[tid] = v;
   __syncthreads();
 
-  // Shared memory reduction
-  for (int off = blockDim.x / 2; off >= 32; off >>= 1) {
-    if (tid < off)
-      smax[tid] = d_fmax(smax[tid], smax[tid + off]);
+  for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+    if (tid < off) {
+      double b = smax[tid + off];
+      if (b > smax[tid])
+        smax[tid] = b;
+    }
     __syncthreads();
   }
 
-  // Warp reduction
-  if (tid < 32) {
-    double my_val = smax[tid];
-    my_val = warp_reduce_max(my_val);
-    if (tid == 0)
-      blockMax[blockIdx.x] = my_val;
+  if (tid == 0) {
+    atomicMaxDoublePos(outMax, smax[0]);
   }
 }
 
 __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
                        double dt_dx, double dt_dy, double half_dt_dx,
                        double half_dt_dy) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= W * H)
+  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  int N = W * H;
+  if (i >= N)
     return;
 
   if (mask[i]) {
@@ -673,6 +800,7 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
   int x = i % W;
   int y = i / W;
 
+  // X faces
   Prim qL_left, qR_left;
   {
     if (x - 1 >= 0 && !mask[d_idx(x - 1, y)]) {
@@ -728,6 +856,7 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
   Cons FxL = hllc_x(prim_to_cons(qL_left), prim_to_cons(qR_left));
   Cons FxR = hllc_x(prim_to_cons(qL_right), prim_to_cons(qR_right));
 
+  // Y faces
   Prim qB_bot, qT_bot;
   {
     if (y - 1 >= 0 && !mask[d_idx(x, y - 1)]) {
@@ -783,6 +912,7 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
   Cons GyB = hllc_y(prim_to_cons(qB_bot), prim_to_cons(qT_bot));
   Cons GyT = hllc_y(prim_to_cons(qB_top), prim_to_cons(qT_top));
 
+  // Hyperbolic update
   Cons Uc = load_cons(U, i);
   Cons Un = Uc;
 
@@ -796,16 +926,14 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
   Un.my -= dt_dy * (GyT.my - GyB.my);
   Un.E -= dt_dy * (GyT.E - GyB.E);
 
+  // Diffusion (25-pt via separable 5-tap 2nd derivative)
   {
     const double inv12 = 1.0 / 12.0;
-    auto S = [&](int sx, int sy) -> Cons {
-      return neighbor_for_diff(U, mask, x, y, x + sx, y + sy);
-    };
 
-    Cons xm2 = S(-2, 0);
-    Cons xm1 = S(-1, 0);
-    Cons xp1 = S(+1, 0);
-    Cons xp2 = S(+2, 0);
+    Cons xm2 = neighbor_for_diff(U, mask, x, y, x - 2, y);
+    Cons xm1 = neighbor_for_diff(U, mask, x, y, x - 1, y);
+    Cons xp1 = neighbor_for_diff(U, mask, x, y, x + 1, y);
+    Cons xp2 = neighbor_for_diff(U, mask, x, y, x + 2, y);
 
     double d2x_rho =
         (-xm2.rho + 16.0 * xm1.rho - 30.0 * Uc.rho + 16.0 * xp1.rho - xp2.rho) *
@@ -819,10 +947,10 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
     double d2x_E =
         (-xm2.E + 16.0 * xm1.E - 30.0 * Uc.E + 16.0 * xp1.E - xp2.E) * inv12;
 
-    Cons ym2 = S(0, -2);
-    Cons ym1 = S(0, -1);
-    Cons yp1 = S(0, +1);
-    Cons yp2 = S(0, +2);
+    Cons ym2 = neighbor_for_diff(U, mask, x, y, x, y - 2);
+    Cons ym1 = neighbor_for_diff(U, mask, x, y, x, y - 1);
+    Cons yp1 = neighbor_for_diff(U, mask, x, y, x, y + 1);
+    Cons yp2 = neighbor_for_diff(U, mask, x, y, x, y + 2);
 
     double d2y_rho =
         (-ym2.rho + 16.0 * ym1.rho - 30.0 * Uc.rho + 16.0 * yp1.rho - yp2.rho) *
@@ -836,26 +964,27 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
     double d2y_E =
         (-ym2.E + 16.0 * ym1.E - 30.0 * Uc.E + 16.0 * yp1.E - yp2.E) * inv12;
 
-    Un.rho += (VISC_RHO * dt) * (d2x_rho + d2y_rho);
-    Un.mx += (VISC_NU * dt) * (d2x_mx + d2y_mx);
-    Un.my += (VISC_NU * dt) * (d2x_my + d2y_my);
-    Un.E += (VISC_E * dt) * (d2x_E + d2y_E);
+    double lap_rho = d2x_rho + d2y_rho;
+    double lap_mx = d2x_mx + d2y_mx;
+    double lap_my = d2x_my + d2y_my;
+    double lap_E = d2x_E + d2y_E;
+
+    Un.rho += (VISC_RHO * dt) * lap_rho;
+    Un.mx += (VISC_NU * dt) * lap_mx;
+    Un.my += (VISC_NU * dt) * lap_my;
+    Un.E += (VISC_E * dt) * lap_E;
   }
 
   Un.rho = d_fmax(Un.rho, EPS_RHO);
   Prim pp = cons_to_prim(Un);
-  if (pp.p <= EPS_P) {
-    pp.p = EPS_P;
+  if (pp.p <= EPS_P || !isfinite(pp.p) || !isfinite(pp.rho) ||
+      !isfinite(pp.u) || !isfinite(pp.v)) {
+    pp.rho = d_fmax(pp.rho, EPS_RHO);
+    pp.p = d_fmax(pp.p, EPS_P);
     Un = prim_to_cons(pp);
   }
 
   store_cons(Uout, i, Un);
-}
-
-__global__ void k_copy(Usoa dst, Usoa src) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < W * H)
-    store_cons(dst, i, load_cons(src, i));
 }
 
 __global__ void k_render_vals(const Usoa U, const uint8_t *mask, int view_mode,
@@ -865,13 +994,14 @@ __global__ void k_render_vals(const Usoa U, const uint8_t *mask, int view_mode,
   __shared__ double smax[256];
 
   int tid = threadIdx.x;
-  int i = blockIdx.x * blockDim.x + tid;
+  int i = (int)(blockIdx.x * blockDim.x + tid);
+  int N = W * H;
 
   double v = 0.0;
   double mn = 1e300;
   double mx = -1e300;
 
-  if (i < W * H && !mask[i]) {
+  if (i < N && !mask[i]) {
     int x = i % W;
     int y = i / W;
 
@@ -908,10 +1038,13 @@ __global__ void k_render_vals(const Usoa U, const uint8_t *mask, int view_mode,
       v = log(d_fmax(p.p / d_fmax(p.rho, EPS_RHO), 1e-30));
     }
 
+    if (!isfinite(v))
+      v = 0.0;
+
     tmpVal[i] = v;
     mn = v;
     mx = v;
-  } else if (i < W * H) {
+  } else if (i < N) {
     tmpVal[i] = 0.0;
   }
 
@@ -919,30 +1052,29 @@ __global__ void k_render_vals(const Usoa U, const uint8_t *mask, int view_mode,
   smax[tid] = mx;
   __syncthreads();
 
-  for (int off = blockDim.x / 2; off >= 32; off >>= 1) {
+  for (int off = blockDim.x / 2; off > 0; off >>= 1) {
     if (tid < off) {
-      smin[tid] = d_fmin(smin[tid], smin[tid + off]);
-      smax[tid] = d_fmax(smax[tid], smax[tid + off]);
+      double bmin = smin[tid + off];
+      double bmax = smax[tid + off];
+      if (bmin < smin[tid])
+        smin[tid] = bmin;
+      if (bmax > smax[tid])
+        smax[tid] = bmax;
     }
     __syncthreads();
   }
 
-  if (tid < 32) {
-    double my_min = smin[tid];
-    double my_max = smax[tid];
-    my_min = warp_reduce_min(my_min);
-    my_max = warp_reduce_max(my_max);
-    if (tid == 0) {
-      blockMin[blockIdx.x] = my_min;
-      blockMax[blockIdx.x] = my_max;
-    }
+  if (tid == 0) {
+    blockMin[blockIdx.x] = smin[0];
+    blockMax[blockIdx.x] = smax[0];
   }
 }
 
 __global__ void k_render_pixels(const uint8_t *mask, const double *tmpVal,
                                 double minv, double invRange, uchar4 *out) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= W * H)
+  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  int N = W * H;
+  if (i >= N)
     return;
 
   if (mask[i]) {
@@ -956,34 +1088,7 @@ __global__ void k_render_pixels(const uint8_t *mask, const double *tmpVal,
   out[i] = pack_rgba(r, g, b);
 }
 
-// Memory-friendly reduction wrappers
-static double reduce_max(double *d_block, double *h_block, int blocks) {
-  CK(cudaMemcpy(h_block, d_block, blocks * sizeof(double),
-                cudaMemcpyDeviceToHost));
-  double m = 1e-12;
-  for (int i = 0; i < blocks; i++) {
-    if (h_block[i] > m)
-      m = h_block[i];
-  }
-  return m;
-}
-
-static void reduce_minmax(double *d_min, double *d_max, double *h_min,
-                          double *h_max, int blocks, double *outMin,
-                          double *outMax) {
-  CK(cudaMemcpy(h_min, d_min, blocks * sizeof(double), cudaMemcpyDeviceToHost));
-  CK(cudaMemcpy(h_max, d_max, blocks * sizeof(double), cudaMemcpyDeviceToHost));
-  double mn = 1e300, mx = -1e300;
-  for (int i = 0; i < blocks; i++) {
-    if (h_min[i] < mn)
-      mn = h_min[i];
-    if (h_max[i] > mx)
-      mx = h_max[i];
-  }
-  *outMin = mn;
-  *outMax = mx;
-}
-
+// general helpers
 static void alloc_Us(Usoa *U, int N) {
   CK(cudaMalloc(&U->rho, N * sizeof(double)));
   CK(cudaMalloc(&U->mx, N * sizeof(double)));
@@ -999,12 +1104,48 @@ static void free_Us(Usoa *U) {
   U->rho = U->mx = U->my = U->E = nullptr;
 }
 
+static void reduce_minmax(double *d_min, double *d_max, int blocks,
+                          double *outMin, double *outMax) {
+  double *hmin = (double *)malloc(blocks * sizeof(double));
+  double *hmax = (double *)malloc(blocks * sizeof(double));
+  CK(cudaMemcpy(hmin, d_min, blocks * sizeof(double), cudaMemcpyDeviceToHost));
+  CK(cudaMemcpy(hmax, d_max, blocks * sizeof(double), cudaMemcpyDeviceToHost));
+  double mn = 1e300, mx = -1e300;
+  for (int i = 0; i < blocks; i++) {
+    if (hmin[i] < mn)
+      mn = hmin[i];
+    if (hmax[i] > mx)
+      mx = hmax[i];
+  }
+  free(hmin);
+  free(hmax);
+  *outMin = mn;
+  *outMax = mx;
+}
+
+static inline void swap_Us(Usoa *a, Usoa *b) {
+  double *t;
+  t = a->rho;
+  a->rho = b->rho;
+  b->rho = t;
+  t = a->mx;
+  a->mx = b->mx;
+  b->mx = t;
+  t = a->my;
+  a->my = b->my;
+  b->my = t;
+  t = a->E;
+  a->E = b->E;
+  b->E = t;
+}
+
+// main
 int main(void) {
   InitWindow(W * SCALE, H * SCALE, "Hypersonic 2D Flow");
   SetTargetFPS(999);
 
   const int N = W * H;
-  unsigned char *pixels = (unsigned char *)malloc(N * 4);
+  unsigned char *pixels = (unsigned char *)malloc((size_t)N * 4);
 
   Image img = {0};
   img.data = pixels;
@@ -1019,28 +1160,24 @@ int main(void) {
   alloc_Us(&dUtmp, N);
 
   uint8_t *dMask = nullptr;
-  CK(cudaMalloc(&dMask, N * sizeof(uint8_t)));
+  CK(cudaMalloc(&dMask, (size_t)N * sizeof(uint8_t)));
 
   double *dTmpVal = nullptr;
-  CK(cudaMalloc(&dTmpVal, N * sizeof(double)));
+  CK(cudaMalloc(&dTmpVal, (size_t)N * sizeof(double)));
 
   uchar4 *dPixels = nullptr;
-  CK(cudaMalloc(&dPixels, N * sizeof(uchar4)));
+  CK(cudaMalloc(&dPixels, (size_t)N * sizeof(uchar4)));
 
   const int threads = 256;
   const int blocksN = (N + threads - 1) / threads;
 
-  double *dBlockMax = nullptr;
   double *dBlockMin = nullptr;
-  double *dBlockMax2 = nullptr;
-  CK(cudaMalloc(&dBlockMax, blocksN * sizeof(double)));
-  CK(cudaMalloc(&dBlockMin, blocksN * sizeof(double)));
-  CK(cudaMalloc(&dBlockMax2, blocksN * sizeof(double)));
+  double *dBlockMax = nullptr;
+  CK(cudaMalloc(&dBlockMin, (size_t)blocksN * sizeof(double)));
+  CK(cudaMalloc(&dBlockMax, (size_t)blocksN * sizeof(double)));
 
-  // Host reduction buffers pre-allocated here
-  double *hBlockMax = (double *)malloc(blocksN * sizeof(double));
-  double *hBlockMin = (double *)malloc(blocksN * sizeof(double));
-  double *hBlockMax2 = (double *)malloc(blocksN * sizeof(double));
+  double *dMaxSpeed = nullptr;
+  CK(cudaMalloc(&dMaxSpeed, sizeof(double)));
 
   auto gpu_init = [&]() {
     k_init<<<blocksN, threads>>>(dU, dMask);
@@ -1067,12 +1204,19 @@ int main(void) {
                                                                       dMask);
         CK(cudaGetLastError());
 
-        k_max_wavespeed<<<blocksN, threads>>>(dU, dMask, dBlockMax);
+        // GPU reduction to a single max wavespeed (no host roundtrip per-block)
+        CK(cudaMemset(dMaxSpeed, 0, sizeof(double)));
+        k_max_wavespeed_atomic<<<blocksN, threads>>>(dU, dMask, dMaxSpeed);
         CK(cudaGetLastError());
         CK(cudaDeviceSynchronize());
 
-        double maxs = reduce_max(dBlockMax, hBlockMax, blocksN);
-        double dt = CFL * 1.0 / maxs;
+        double maxs = 1e-12;
+        CK(cudaMemcpy(&maxs, dMaxSpeed, sizeof(double),
+                      cudaMemcpyDeviceToHost));
+        if (!isfinite(maxs) || maxs < 1e-12)
+          maxs = 1e-12;
+
+        double dt = CFL * 1.0 / maxs; // dx=dy=1
         double dt_dx = dt;
         double dt_dy = dt;
         double half_dt_dx = 0.5 * dt_dx;
@@ -1083,30 +1227,31 @@ int main(void) {
         CK(cudaGetLastError());
         CK(cudaDeviceSynchronize());
 
-        k_copy<<<blocksN, threads>>>(dU, dUtmp);
-        CK(cudaGetLastError());
-        CK(cudaDeviceSynchronize());
+        // Ping-pong swap (removes k_copy full-grid copy)
+        swap_Us(&dU, &dUtmp);
 
         sim_t += dt;
       }
     }
 
+    // render pass A: vals + per-block min/max
     k_render_vals<<<blocksN, threads>>>(dU, dMask, view_mode, dTmpVal,
-                                        dBlockMin, dBlockMax2);
+                                        dBlockMin, dBlockMax);
     CK(cudaGetLastError());
     CK(cudaDeviceSynchronize());
 
     double minv, maxv;
-    reduce_minmax(dBlockMin, dBlockMax2, hBlockMin, hBlockMax2, blocksN, &minv,
-                  &maxv);
+    reduce_minmax(dBlockMin, dBlockMax, blocksN, &minv, &maxv);
     double invRange = 1.0 / fmax(maxv - minv, 1e-30);
 
+    // render pass B: pixels
     k_render_pixels<<<blocksN, threads>>>(dMask, dTmpVal, minv, invRange,
                                           dPixels);
     CK(cudaGetLastError());
     CK(cudaDeviceSynchronize());
 
-    CK(cudaMemcpy(pixels, dPixels, N * sizeof(uchar4), cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(pixels, dPixels, (size_t)N * sizeof(uchar4),
+                  cudaMemcpyDeviceToHost));
     UpdateTexture(tex, pixels);
 
     BeginDrawing();
@@ -1132,16 +1277,13 @@ int main(void) {
   CloseWindow();
 
   free(pixels);
-  free(hBlockMax);
-  free(hBlockMin);
-  free(hBlockMax2);
 
   cudaFree(dMask);
   cudaFree(dTmpVal);
   cudaFree(dPixels);
-  cudaFree(dBlockMax);
   cudaFree(dBlockMin);
-  cudaFree(dBlockMax2);
+  cudaFree(dBlockMax);
+  cudaFree(dMaxSpeed);
 
   free_Us(&dU);
   free_Us(&dUtmp);
