@@ -1458,7 +1458,6 @@ int main(int argc, char **argv) {
         k_step<<<blocksN, threads>>>(dU, dUtmp, dMask, dXFlux, dYFlux, dt,
                                      dt_dx, dt_dy);
         CK(cudaGetLastError());
-        CK(cudaDeviceSynchronize());
 
         // Ping-pong swap (removes k_copy full-grid copy)
         swap_Us(&dU, &dUtmp);
@@ -1471,7 +1470,6 @@ int main(int argc, char **argv) {
     k_render_vals<<<blocksN, threads>>>(dU, dMask, view_mode, dTmpVal,
                                         dBlockMin, dBlockMax);
     CK(cudaGetLastError());
-    CK(cudaDeviceSynchronize());
 
     const double *curMin = dBlockMin;
     const double *curMax = dBlockMax;
@@ -1497,6 +1495,7 @@ int main(int argc, char **argv) {
     k_render_pixels<<<blocksN, threads>>>(dMask, dTmpVal, curMin, dInvRange,
                                           dPixels);
     CK(cudaGetLastError());
+
     CK(cudaDeviceSynchronize());
 
     CK(cudaMemcpy(pixels, dPixels, (size_t)N * sizeof(uchar4),
