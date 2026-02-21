@@ -1476,12 +1476,96 @@ static bool parse_args(int argc, char **argv, SimConfig *cfg) {
     }
   }
 
-  if (cfg->gamma <= 1.0 || cfg->cfl <= 0.0 || cfg->visc_nu < 0.0 ||
-      cfg->visc_rho < 0.0 || cfg->visc_e < 0.0 || cfg->inflow_mach <= 0.0 ||
-      cfg->steps_per_frame <= 0 || cfg->steps_per_frame > max_steps_per_frame ||
-      cfg->geom_Rb <= 0.0 || cfg->geom_Rn <= 0.0 ||
-      cfg->geom_theta <= 0.0 || cfg->geom_theta >= 0.5 * kPi) {
-    fprintf(stderr, "Invalid physical/geometry config values.\n");
+  if (cfg->gamma <= 1.0) {
+    fprintf(stderr, "Invalid --gamma: %.8g (must be > 1).\n", cfg->gamma);
+    return false;
+  }
+  if (cfg->cfl <= 0.0) {
+    fprintf(stderr, "Invalid --cfl: %.8g (must be > 0).\n", cfg->cfl);
+    return false;
+  }
+  if (cfg->visc_nu < 0.0) {
+    fprintf(stderr, "Invalid --visc-nu: %.8g (must be >= 0).\n", cfg->visc_nu);
+    return false;
+  }
+  if (cfg->visc_rho < 0.0) {
+    fprintf(stderr, "Invalid --visc-rho: %.8g (must be >= 0).\n",
+            cfg->visc_rho);
+    return false;
+  }
+  if (cfg->visc_e < 0.0) {
+    fprintf(stderr, "Invalid --visc-e: %.8g (must be >= 0).\n", cfg->visc_e);
+    return false;
+  }
+  if (cfg->inflow_mach <= 0.0) {
+    fprintf(stderr, "Invalid --mach: %.8g (must be > 0).\n", cfg->inflow_mach);
+    return false;
+  }
+  if (cfg->steps_per_frame <= 0 || cfg->steps_per_frame > max_steps_per_frame) {
+    fprintf(stderr,
+            "Invalid --steps-per-frame: %d (must be in [1, %d]).\n",
+            cfg->steps_per_frame, max_steps_per_frame);
+    return false;
+  }
+
+  if (!isfinite(cfg->geom_x0)) {
+    fprintf(stderr, "Invalid --geom-x0: %.8g (must be finite).\n", cfg->geom_x0);
+    return false;
+  }
+  if (!isfinite(cfg->geom_cy)) {
+    fprintf(stderr, "Invalid --geom-cy: %.8g (must be finite).\n", cfg->geom_cy);
+    return false;
+  }
+  if (cfg->geom_Rb <= 0.0) {
+    fprintf(stderr, "Invalid --geom-rb: %.8g (must be > 0).\n", cfg->geom_Rb);
+    return false;
+  }
+  if (cfg->geom_Rn <= 0.0) {
+    fprintf(stderr, "Invalid --geom-rn: %.8g (must be > 0).\n", cfg->geom_Rn);
+    return false;
+  }
+  if (cfg->geom_theta <= 0.0 || cfg->geom_theta >= 0.5 * kPi) {
+    fprintf(stderr,
+            "Invalid --geom-theta: %.8g (must be in (0, pi/2)).\n",
+            cfg->geom_theta);
+    return false;
+  }
+
+  const double st = sin(cfg->geom_theta);
+  const double ct = cos(cfg->geom_theta);
+  const double tt = tan(cfg->geom_theta);
+  const double xt = cfg->geom_Rn * (1.0 - st);
+  const double rt = cfg->geom_Rn * ct;
+
+  if (cfg->geom_Rb < rt) {
+    fprintf(stderr,
+            "Invalid geometry: --geom-rb %.8g is smaller than the tangent "
+            "radius %.8g implied by --geom-rn %.8g and --geom-theta %.8g. "
+            "Require geom-rb >= geom-rn*cos(theta).\n",
+            cfg->geom_Rb, rt, cfg->geom_Rn, cfg->geom_theta);
+    return false;
+  }
+  if (!isfinite(tt) || tt <= 0.0) {
+    fprintf(stderr,
+            "Invalid geometry: tan(theta)=%.8g for --geom-theta %.8g "
+            "must be finite and positive.\n",
+            tt, cfg->geom_theta);
+    return false;
+  }
+
+  const double xb = xt + (cfg->geom_Rb - rt) / tt;
+  if (!isfinite(xb)) {
+    fprintf(stderr,
+            "Invalid geometry: computed xb is non-finite (xb=%.8g) from "
+            "--geom-rb %.8g --geom-rn %.8g --geom-theta %.8g.\n",
+            xb, cfg->geom_Rb, cfg->geom_Rn, cfg->geom_theta);
+    return false;
+  }
+  if (xb < xt) {
+    fprintf(stderr,
+            "Invalid geometry: computed xb %.8g is behind cone tangent point "
+            "xt %.8g. Increase --geom-rb or reduce --geom-rn/--geom-theta.\n",
+            xb, xt);
     return false;
   }
 
