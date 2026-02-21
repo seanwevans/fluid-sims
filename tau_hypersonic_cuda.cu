@@ -1476,7 +1476,16 @@ int main(int argc, char **argv) {
         if (!isfinite(maxs) || maxs < 1e-12)
           maxs = 1e-12;
 
-        double dt = h_cfg.cfl * 1.0 / maxs; // dx=dy=1
+        double dt_convective = h_cfg.cfl * 1.0 / maxs; // dx=dy=1
+
+        double nu_max = fmax(h_cfg.visc_nu, fmax(h_cfg.visc_rho, h_cfg.visc_e));
+        double dt_diff = dt_convective;
+        if (isfinite(nu_max) && nu_max > 1e-12) {
+          // Explicit 2D diffusion stability limit for dx=dy=1.
+          dt_diff = 0.25 / nu_max;
+        }
+
+        double dt = fmin(dt_convective, dt_diff);
         double dt_dx = dt;
         double dt_dy = dt;
         double half_dt_dx = 0.5 * dt_dx;
