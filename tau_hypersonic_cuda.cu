@@ -17,6 +17,8 @@
 #include "raylib.h"
 #endif
 #include <cuda_runtime.h>
+#include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1294,8 +1296,9 @@ static bool parse_double_flag(const char *name, const char *value, double *out) 
 
 static bool parse_int_flag(const char *name, const char *value, int *out) {
   char *end = nullptr;
+  errno = 0;
   long v = strtol(value, &end, 10);
-  if (!end || *end != '\0') {
+  if (!end || *end != '\0' || errno == ERANGE || v < INT_MIN || v > INT_MAX) {
     fprintf(stderr, "Invalid value for %s: %s\n", name, value);
     return false;
   }
@@ -1304,6 +1307,8 @@ static bool parse_int_flag(const char *name, const char *value, int *out) {
 }
 
 static bool parse_args(int argc, char **argv, SimConfig *cfg) {
+  const int max_steps_per_frame = 1024;
+
   for (int i = 1; i < argc; i++) {
     const char *arg = argv[i];
     if (strcmp(arg, "--mach") == 0 && i + 1 < argc) {
@@ -1350,7 +1355,8 @@ static bool parse_args(int argc, char **argv, SimConfig *cfg) {
 
   if (cfg->gamma <= 1.0 || cfg->cfl <= 0.0 || cfg->visc_nu < 0.0 ||
       cfg->visc_rho < 0.0 || cfg->visc_e < 0.0 || cfg->inflow_mach <= 0.0 ||
-      cfg->steps_per_frame <= 0 || cfg->geom_Rb <= 0.0 || cfg->geom_Rn <= 0.0 ||
+      cfg->steps_per_frame <= 0 || cfg->steps_per_frame > max_steps_per_frame ||
+      cfg->geom_Rb <= 0.0 || cfg->geom_Rn <= 0.0 ||
       cfg->geom_theta <= 0.0 || cfg->geom_theta >= 0.5 * PI) {
     fprintf(stderr, "Invalid physical/geometry config values.\n");
     return false;
