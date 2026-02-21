@@ -800,6 +800,19 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
   int x = i % W;
   int y = i / W;
 
+  // Reuse center reconstructions for both adjacent faces.
+  FacePrim fpCx = reconstruct_x(U, mask, x, y);
+  Cons fpCx_L = prim_to_cons(fpCx.L);
+  Cons fpCx_R = prim_to_cons(fpCx.R);
+  Cons fpCx_FL = flux_x(fpCx_L);
+  Cons fpCx_FR = flux_x(fpCx_R);
+
+  FacePrim fpCy = reconstruct_y(U, mask, x, y);
+  Cons fpCy_L = prim_to_cons(fpCy.L);
+  Cons fpCy_R = prim_to_cons(fpCy.R);
+  Cons fpCy_GL = flux_y(fpCy_L);
+  Cons fpCy_GR = flux_y(fpCy_R);
+
   // X faces
   Prim qL_left, qR_left;
   {
@@ -814,12 +827,9 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
       qL_left = cons_to_prim(neighbor_or_wall(U, mask, x, y, -1, 0));
     }
 
-    FacePrim fpC = reconstruct_x(U, mask, x, y);
-    Cons FRf = flux_x(prim_to_cons(fpC.R));
-    Cons FRb = flux_x(prim_to_cons(fpC.L));
-    qR_left =
-        half_step_predict_x(fpC.L, (FRf.rho - FRb.rho), (FRf.mx - FRb.mx),
-                            (FRf.my - FRb.my), (FRf.E - FRb.E), half_dt_dx);
+    qR_left = half_step_predict_x(
+        fpCx.L, (fpCx_FR.rho - fpCx_FL.rho), (fpCx_FR.mx - fpCx_FL.mx),
+        (fpCx_FR.my - fpCx_FL.my), (fpCx_FR.E - fpCx_FL.E), half_dt_dx);
 
     qL_left.rho = d_fmax(qL_left.rho, EPS_RHO);
     qL_left.p = d_fmax(qL_left.p, EPS_P);
@@ -829,12 +839,9 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
 
   Prim qL_right, qR_right;
   {
-    FacePrim fpC = reconstruct_x(U, mask, x, y);
-    Cons CFf = flux_x(prim_to_cons(fpC.R));
-    Cons CFb = flux_x(prim_to_cons(fpC.L));
-    qL_right =
-        half_step_predict_x(fpC.R, (CFf.rho - CFb.rho), (CFf.mx - CFb.mx),
-                            (CFf.my - CFb.my), (CFf.E - CFb.E), half_dt_dx);
+    qL_right = half_step_predict_x(
+        fpCx.R, (fpCx_FR.rho - fpCx_FL.rho), (fpCx_FR.mx - fpCx_FL.mx),
+        (fpCx_FR.my - fpCx_FL.my), (fpCx_FR.E - fpCx_FL.E), half_dt_dx);
 
     if (x + 1 < W && !mask[d_idx(x + 1, y)]) {
       FacePrim fpN = reconstruct_x(U, mask, x + 1, y);
@@ -870,12 +877,9 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
       qB_bot = cons_to_prim(neighbor_or_wall(U, mask, x, y, 0, -1));
     }
 
-    FacePrim fpC = reconstruct_y(U, mask, x, y);
-    Cons GTf = flux_y(prim_to_cons(fpC.R));
-    Cons GTb = flux_y(prim_to_cons(fpC.L));
-    qT_bot =
-        half_step_predict_y(fpC.L, (GTf.rho - GTb.rho), (GTf.mx - GTb.mx),
-                            (GTf.my - GTb.my), (GTf.E - GTb.E), half_dt_dy);
+    qT_bot = half_step_predict_y(
+        fpCy.L, (fpCy_GR.rho - fpCy_GL.rho), (fpCy_GR.mx - fpCy_GL.mx),
+        (fpCy_GR.my - fpCy_GL.my), (fpCy_GR.E - fpCy_GL.E), half_dt_dy);
 
     qB_bot.rho = d_fmax(qB_bot.rho, EPS_RHO);
     qB_bot.p = d_fmax(qB_bot.p, EPS_P);
@@ -885,12 +889,9 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, double dt,
 
   Prim qB_top, qT_top;
   {
-    FacePrim fpC = reconstruct_y(U, mask, x, y);
-    Cons CFf = flux_y(prim_to_cons(fpC.R));
-    Cons CFb = flux_y(prim_to_cons(fpC.L));
-    qB_top =
-        half_step_predict_y(fpC.R, (CFf.rho - CFb.rho), (CFf.mx - CFb.mx),
-                            (CFf.my - CFb.my), (CFf.E - CFb.E), half_dt_dy);
+    qB_top = half_step_predict_y(
+        fpCy.R, (fpCy_GR.rho - fpCy_GL.rho), (fpCy_GR.mx - fpCy_GL.mx),
+        (fpCy_GR.my - fpCy_GL.my), (fpCy_GR.E - fpCy_GL.E), half_dt_dy);
 
     if (y + 1 < H && !mask[d_idx(x, y + 1)]) {
       FacePrim fpN = reconstruct_y(U, mask, x, y + 1);
