@@ -172,10 +172,12 @@ __device__ __forceinline__ void store_cons(Usoa U, int i, Cons c) {
   U.E[i] = c.E;
 }
 
-__device__ __forceinline__ Cons reflect_noslip(Cons inside) {
-  Prim p = cons_to_prim(inside);
-  Prim g{p.rho, -p.u, -p.v, p.p};
-  return prim_to_cons(g);
+__device__ __forceinline__ Prim wall_ghost_prim(Prim inside) {
+  // Wall model: reflective no-slip ghost state built from the adjacent fluid
+  // cell. We preserve thermodynamic state and flip velocity so the wall face
+  // velocity is zero at the interface (instead of imposing a fixed stagnation
+  // state unrelated to local interior conditions).
+  return Prim{inside.rho, -inside.u, -inside.v, inside.p};
 }
 
 __device__ __forceinline__ Cons neighbor_or_wall(const Usoa U,
@@ -198,7 +200,7 @@ __device__ __forceinline__ Cons neighbor_or_wall(const Usoa U,
 
   int j = d_idx(xn, yn);
   if (mask[j]) {
-    return reflect_noslip(load_cons(U, d_idx(x, y)));
+    return prim_to_cons(wall_ghost_prim(cons_to_prim(load_cons(U, d_idx(x, y)))));
   }
   return load_cons(U, j);
 }
@@ -220,7 +222,8 @@ __device__ __forceinline__ Cons neighbor_for_diff(const Usoa U,
 
   int j = d_idx(xn, yn);
   if (mask[j]) {
-    return reflect_noslip(load_cons(U, d_idx(xc, yc)));
+    return prim_to_cons(
+        wall_ghost_prim(cons_to_prim(load_cons(U, d_idx(xc, yc)))));
   }
   return load_cons(U, j);
 }
@@ -666,8 +669,8 @@ __device__ __forceinline__ void get_color(double t, uint8_t &r, uint8_t &g,
 }
 
 __device__ __forceinline__ Prim sample_prim_bc(const Usoa U,
-                                               const uint8_t *mask, int x,
-                                               int y) {
+                                               const uint8_t *mask, int xc,
+                                               int yc, int x, int y) {
   if (y < 0)
     y = 0;
   if (y >= H)
@@ -682,8 +685,10 @@ __device__ __forceinline__ Prim sample_prim_bc(const Usoa U,
 
   int i = d_idx(x, y);
   if (mask[i]) {
-    Prim infl = inflow_state();
-    return Prim{infl.rho, 0.0, 0.0, infl.p};
+    // Keep render-side boundary sampling consistent with solver ghost states,
+    // especially for gradient-based views (schlieren and vorticity).
+    Prim interior = cons_to_prim(load_cons(U, d_idx(xc, yc)));
+    return wall_ghost_prim(interior);
   }
   return cons_to_prim(load_cons(U, i));
 }
@@ -1026,18 +1031,18 @@ __global__ void k_render_vals(const Usoa U, const uint8_t *mask, int view_mode,
     } else if (view_mode == 2) {
       v = sqrt(p.u * p.u + p.v * p.v);
     } else if (view_mode == 3) {
-      double rhoL = sample_prim_bc(U, mask, x - 1, y).rho;
-      double rhoR = sample_prim_bc(U, mask, x + 1, y).rho;
-      double rhoB = sample_prim_bc(U, mask, x, y - 1).rho;
-      double rhoT = sample_prim_bc(U, mask, x, y + 1).rho;
+      double rhoL = sample_prim_bc(U, mask, x, y, x - 1, y).rho;
+      double rhoR = sample_prim_bc(U, mask, x, y, x + 1, y).rho;
+      double rhoB = sample_prim_bc(U, mask, x, y, x, y - 1).rho;
+      double rhoT = sample_prim_bc(U, mask, x, y, x, y + 1).rho;
       double gx = 0.5 * (rhoR - rhoL);
       double gy = 0.5 * (rhoT - rhoB);
       v = log(1e-12 + sqrt(gx * gx + gy * gy));
     } else if (view_mode == 4) {
-      Prim pL = sample_prim_bc(U, mask, x - 1, y);
-      Prim pR = sample_prim_bc(U, mask, x + 1, y);
-      Prim pB = sample_prim_bc(U, mask, x, y - 1);
-      Prim pT = sample_prim_bc(U, mask, x, y + 1);
+      Prim pL = sample_prim_bc(U, mask, x, y, x - 1, y);
+      Prim pR = sample_prim_bc(U, mask, x, y, x + 1, y);
+      Prim pB = sample_prim_bc(U, mask, x, y, x, y - 1);
+      Prim pT = sample_prim_bc(U, mask, x, y, x, y + 1);
       double dv_dx = 0.5 * (pR.v - pL.v);
       double du_dy = 0.5 * (pT.u - pB.u);
       double omega = dv_dx - du_dy;
