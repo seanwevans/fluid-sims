@@ -120,45 +120,48 @@ __device__ __forceinline__ double sound_speed(Prim p) {
   return sqrt(d_cfg.gamma * d_fmax(p.p, EPS_P) / d_fmax(p.rho, EPS_RHO));
 }
 
-__device__ __forceinline__ Cons flux_x(Cons c) {
+enum class Axis : int { X = 0, Y = 1 };
+
+template <Axis AX>
+__device__ __forceinline__ double prim_normal(const Prim &p) {
+  if constexpr (AX == Axis::X) {
+    return p.u;
+  }
+  return p.v;
+}
+
+template <Axis AX>
+__device__ __forceinline__ double prim_tangent(const Prim &p) {
+  if constexpr (AX == Axis::X) {
+    return p.v;
+  }
+  return p.u;
+}
+
+template <Axis AX>
+__device__ __forceinline__ Cons flux_axis(Cons c) {
   Prim p = cons_to_prim(c);
   Cons f;
-  f.rho = c.mx;
-  f.mx = c.mx * p.u + p.p;
-  f.my = c.my * p.u;
-  f.E = (c.E + p.p) * p.u;
+  double un = prim_normal<AX>(p);
+  f.rho = (AX == Axis::X) ? c.mx : c.my;
+  f.mx = (AX == Axis::X) ? (c.mx * un + p.p) : (c.mx * un);
+  f.my = (AX == Axis::X) ? (c.my * un) : (c.my * un + p.p);
+  f.E = (c.E + p.p) * un;
   return f;
 }
 
-__device__ __forceinline__ Cons flux_x(Prim p) {
-  Cons c = prim_to_cons(p);
-  Cons f;
-  f.rho = c.mx;
-  f.mx = c.mx * p.u + p.p;
-  f.my = c.my * p.u;
-  f.E = (c.E + p.p) * p.u;
-  return f;
+template <Axis AX>
+__device__ __forceinline__ Cons flux_axis(Prim p) {
+  return flux_axis<AX>(prim_to_cons(p));
 }
 
-__device__ __forceinline__ Cons flux_y(Cons c) {
-  Prim p = cons_to_prim(c);
-  Cons f;
-  f.rho = c.my;
-  f.mx = c.mx * p.v;
-  f.my = c.my * p.v + p.p;
-  f.E = (c.E + p.p) * p.v;
-  return f;
-}
+__device__ __forceinline__ Cons flux_x(Cons c) { return flux_axis<Axis::X>(c); }
 
-__device__ __forceinline__ Cons flux_y(Prim p) {
-  Cons c = prim_to_cons(p);
-  Cons f;
-  f.rho = c.my;
-  f.mx = c.mx * p.v;
-  f.my = c.my * p.v + p.p;
-  f.E = (c.E + p.p) * p.v;
-  return f;
-}
+__device__ __forceinline__ Cons flux_x(Prim p) { return flux_axis<Axis::X>(p); }
+
+__device__ __forceinline__ Cons flux_y(Cons c) { return flux_axis<Axis::Y>(c); }
+
+__device__ __forceinline__ Cons flux_y(Prim p) { return flux_axis<Axis::Y>(p); }
 
 __device__ __forceinline__ double minmod(double a, double b) {
   if (a * b <= 0.0)
@@ -277,12 +280,16 @@ __device__ __forceinline__ void enforce_positive_faces(Prim &qm, const Prim &qc,
   qp.p = d_fmax(qp.p, EPS_P);
 }
 
-__device__ __forceinline__ FacePrim reconstruct_x(const Usoa U,
-                                                  const uint8_t *mask, int x,
-                                                  int y) {
+template <Axis AX>
+__device__ __forceinline__ FacePrim reconstruct_axis(const Usoa U,
+                                                     const uint8_t *mask,
+                                                     int x, int y) {
+  constexpr int DX = (AX == Axis::X) ? 1 : 0;
+  constexpr int DY = (AX == Axis::X) ? 0 : 1;
+
   Cons Uc = load_cons(U, d_idx(x, y));
-  Cons Um = neighbor_or_wall(U, mask, x, y, -1, 0);
-  Cons Up = neighbor_or_wall(U, mask, x, y, +1, 0);
+  Cons Um = neighbor_or_wall(U, mask, x, y, -DX, -DY);
+  Cons Up = neighbor_or_wall(U, mask, x, y, +DX, +DY);
 
   Prim qm = cons_to_prim(Um);
   Prim qc = cons_to_prim(Uc);
@@ -313,70 +320,47 @@ __device__ __forceinline__ FacePrim reconstruct_x(const Usoa U,
   return FacePrim{qL, qR};
 }
 
+__device__ __forceinline__ FacePrim reconstruct_x(const Usoa U,
+                                                  const uint8_t *mask, int x,
+                                                  int y) {
+  return reconstruct_axis<Axis::X>(U, mask, x, y);
+}
+
 __device__ __forceinline__ FacePrim reconstruct_y(const Usoa U,
                                                   const uint8_t *mask, int x,
                                                   int y) {
-  Cons Uc = load_cons(U, d_idx(x, y));
-  Cons Um = neighbor_or_wall(U, mask, x, y, 0, -1);
-  Cons Up = neighbor_or_wall(U, mask, x, y, 0, +1);
+  return reconstruct_axis<Axis::Y>(U, mask, x, y);
+}
 
-  Prim qm = cons_to_prim(Um);
-  Prim qc = cons_to_prim(Uc);
-  Prim qp = cons_to_prim(Up);
-
-  double dl_rho = qc.rho - qm.rho, dr_rho = qp.rho - qc.rho;
-  double dc_rho = 0.5 * (qp.rho - qm.rho);
-  double s_rho = mc_limiter(dl_rho, dc_rho, dr_rho);
-
-  double dl_u = qc.u - qm.u, dr_u = qp.u - qc.u;
-  double dc_u = 0.5 * (qp.u - qm.u);
-  double s_u = mc_limiter(dl_u, dc_u, dr_u);
-
-  double dl_v = qc.v - qm.v, dr_v = qp.v - qc.v;
-  double dc_v = 0.5 * (qp.v - qm.v);
-  double s_v = mc_limiter(dl_v, dc_v, dr_v);
-
-  double dl_p = qc.p - qm.p, dr_p = qp.p - qc.p;
-  double dc_p = 0.5 * (qp.p - qm.p);
-  double s_p = mc_limiter(dl_p, dc_p, dr_p);
-
-  Prim qL{qc.rho - 0.5 * s_rho, qc.u - 0.5 * s_u, qc.v - 0.5 * s_v,
-          qc.p - 0.5 * s_p};
-  Prim qR{qc.rho + 0.5 * s_rho, qc.u + 0.5 * s_u, qc.v + 0.5 * s_v,
-          qc.p + 0.5 * s_p};
-
-  enforce_positive_faces(qL, qc, qR);
-  return FacePrim{qL, qR};
+template <Axis AX>
+__device__ __forceinline__ Prim half_step_predict_axis(Prim q, Cons dF,
+                                                       double half_dt_dn) {
+  (void)AX;
+  Cons c = prim_to_cons(q);
+  c.rho -= half_dt_dn * dF.rho;
+  c.mx -= half_dt_dn * dF.mx;
+  c.my -= half_dt_dn * dF.my;
+  c.E -= half_dt_dn * dF.E;
+  Prim out = cons_to_prim(c);
+  out.rho = d_fmax(out.rho, EPS_RHO);
+  out.p = d_fmax(out.p, EPS_P);
+  return out;
 }
 
 __device__ __forceinline__ Prim half_step_predict_x(Prim q, double dF_rho,
                                                     double dF_mx, double dF_my,
                                                     double dF_E,
                                                     double half_dt_dx) {
-  Cons c = prim_to_cons(q);
-  c.rho -= half_dt_dx * dF_rho;
-  c.mx -= half_dt_dx * dF_mx;
-  c.my -= half_dt_dx * dF_my;
-  c.E -= half_dt_dx * dF_E;
-  Prim out = cons_to_prim(c);
-  out.rho = d_fmax(out.rho, EPS_RHO);
-  out.p = d_fmax(out.p, EPS_P);
-  return out;
+  return half_step_predict_axis<Axis::X>(
+      q, Cons{dF_rho, dF_mx, dF_my, dF_E}, half_dt_dx);
 }
 
 __device__ __forceinline__ Prim half_step_predict_y(Prim q, double dG_rho,
                                                     double dG_mx, double dG_my,
                                                     double dG_E,
                                                     double half_dt_dy) {
-  Cons c = prim_to_cons(q);
-  c.rho -= half_dt_dy * dG_rho;
-  c.mx -= half_dt_dy * dG_mx;
-  c.my -= half_dt_dy * dG_my;
-  c.E -= half_dt_dy * dG_E;
-  Prim out = cons_to_prim(c);
-  out.rho = d_fmax(out.rho, EPS_RHO);
-  out.p = d_fmax(out.p, EPS_P);
-  return out;
+  return half_step_predict_axis<Axis::Y>(
+      q, Cons{dG_rho, dG_mx, dG_my, dG_E}, half_dt_dy);
 }
 
 __device__ __forceinline__ Cons cons_sub(Cons a, Cons b) {
@@ -389,16 +373,19 @@ __device__ __forceinline__ Cons cons_mul(double s, Cons a) {
   return Cons{s * a.rho, s * a.mx, s * a.my, s * a.E};
 }
 
-__device__ __forceinline__ Cons hlle_x(Cons UL, Cons UR) {
+template <Axis AX>
+__device__ __forceinline__ Cons hlle_axis(Cons UL, Cons UR) {
   Prim L = cons_to_prim(UL);
   Prim R = cons_to_prim(UR);
+  double uL = prim_normal<AX>(L);
+  double uR = prim_normal<AX>(R);
   double aL = sound_speed(L);
   double aR = sound_speed(R);
-  double SL = d_fmin(L.u - aL, R.u - aR);
-  double SR = d_fmax(L.u + aL, R.u + aR);
+  double SL = d_fmin(uL - aL, uR - aR);
+  double SR = d_fmax(uL + aL, uR + aR);
 
-  Cons FL = flux_x(UL);
-  Cons FR = flux_x(UR);
+  Cons FL = flux_axis<AX>(UL);
+  Cons FR = flux_axis<AX>(UR);
 
   if (SL >= 0.0)
     return FL;
@@ -409,215 +396,126 @@ __device__ __forceinline__ Cons hlle_x(Cons UL, Cons UR) {
   if (d_fabs(denom) < 1e-14)
     return cons_mul(0.5, cons_add(FL, FR));
 
-  // F = (SR*FL - SL*FR + SL*SR*(UR-UL)) / (SR-SL)
   Cons term1 = cons_mul(SR, FL);
   Cons term2 = cons_mul(-SL, FR);
   Cons term3 = cons_mul(SL * SR, cons_sub(UR, UL));
   return cons_mul(1.0 / denom, cons_add(cons_add(term1, term2), term3));
+}
+
+__device__ __forceinline__ Cons hlle_x(Cons UL, Cons UR) {
+  return hlle_axis<Axis::X>(UL, UR);
 }
 
 __device__ __forceinline__ Cons hlle_y(Cons UL, Cons UR) {
+  return hlle_axis<Axis::Y>(UL, UR);
+}
+
+template <Axis AX>
+__device__ __forceinline__ Cons hllc_axis(Cons UL, Cons UR) {
   Prim L = cons_to_prim(UL);
   Prim R = cons_to_prim(UR);
+
+  double unL = prim_normal<AX>(L);
+  double unR = prim_normal<AX>(R);
+  double utL = prim_tangent<AX>(L);
+  double utR = prim_tangent<AX>(R);
+
   double aL = sound_speed(L);
   double aR = sound_speed(R);
-  double SL = d_fmin(L.v - aL, R.v - aR);
-  double SR = d_fmax(L.v + aL, R.v + aR);
 
-  Cons FL = flux_y(UL);
-  Cons FR = flux_y(UR);
+  double SL = d_fmin(unL - aL, unR - aR);
+  double SR = d_fmax(unL + aL, unR + aR);
+
+  Cons FL = flux_axis<AX>(UL);
+  Cons FR = flux_axis<AX>(UR);
 
   if (SL >= 0.0)
     return FL;
   if (SR <= 0.0)
     return FR;
 
-  double denom = SR - SL;
-  if (d_fabs(denom) < 1e-14)
-    return cons_mul(0.5, cons_add(FL, FR));
+  double rhoL = L.rho, rhoR = R.rho;
+  double pL = L.p, pR = R.p;
 
-  Cons term1 = cons_mul(SR, FL);
-  Cons term2 = cons_mul(-SL, FR);
-  Cons term3 = cons_mul(SL * SR, cons_sub(UR, UL));
-  return cons_mul(1.0 / denom, cons_add(cons_add(term1, term2), term3));
+  double num = pR - pL + rhoL * unL * (SL - unL) - rhoR * unR * (SR - unR);
+  double den = rhoL * (SL - unL) - rhoR * (SR - unR);
+
+  if (d_fabs(den) < 1e-14 || !isfinite(num) || !isfinite(den)) {
+    return hlle_axis<AX>(UL, UR);
+  }
+
+  double SM = num / den;
+  if (!isfinite(SM))
+    return hlle_axis<AX>(UL, UR);
+
+  double pStar = pL + rhoL * (SL - unL) * (SM - unL);
+  pStar = d_fmax(pStar, EPS_P);
+
+  double dLS = (SL - SM);
+  double dRS = (SR - SM);
+  if (d_fabs(dLS) < 1e-14 || d_fabs(dRS) < 1e-14) {
+    return hlle_axis<AX>(UL, UR);
+  }
+
+  double rhoStarL = rhoL * (SL - unL) / dLS;
+  double rhoStarR = rhoR * (SR - unR) / dRS;
+
+  if (!(rhoStarL > 0.0) || !(rhoStarR > 0.0) || !isfinite(rhoStarL) ||
+      !isfinite(rhoStarR)) {
+    return hlle_axis<AX>(UL, UR);
+  }
+
+  double momNL = rhoStarL * SM;
+  double momTL = rhoStarL * utL;
+  double EL = UL.E;
+  double EStarL = ((SL - unL) * EL - pL * unL + pStar * SM) / dLS;
+  if (!isfinite(EStarL))
+    return hlle_axis<AX>(UL, UR);
+  Cons UStarL = (AX == Axis::X)
+                    ? Cons{rhoStarL, momNL, momTL, EStarL}
+                    : Cons{rhoStarL, momTL, momNL, EStarL};
+
+  double momNR = rhoStarR * SM;
+  double momTR = rhoStarR * utR;
+  double ER = UR.E;
+  double EStarR = ((SR - unR) * ER - pR * unR + pStar * SM) / dRS;
+  if (!isfinite(EStarR))
+    return hlle_axis<AX>(UL, UR);
+  Cons UStarR = (AX == Axis::X)
+                    ? Cons{rhoStarR, momNR, momTR, EStarR}
+                    : Cons{rhoStarR, momTR, momNR, EStarR};
+
+  if (SM >= 0.0) {
+    Cons F;
+    F.rho = FL.rho + SL * (UStarL.rho - UL.rho);
+    F.mx = FL.mx + SL * (UStarL.mx - UL.mx);
+    F.my = FL.my + SL * (UStarL.my - UL.my);
+    F.E = FL.E + SL * (UStarL.E - UL.E);
+    return F;
+  }
+
+  Cons F;
+  F.rho = FR.rho + SR * (UStarR.rho - UR.rho);
+  F.mx = FR.mx + SR * (UStarR.mx - UR.mx);
+  F.my = FR.my + SR * (UStarR.my - UR.my);
+  F.E = FR.E + SR * (UStarR.E - UR.E);
+  return F;
 }
 
 __device__ __forceinline__ Cons hllc_x(Cons UL, Cons UR) {
-  Prim L = cons_to_prim(UL);
-  Prim R = cons_to_prim(UR);
-
-  double aL = sound_speed(L);
-  double aR = sound_speed(R);
-
-  double SL = d_fmin(L.u - aL, R.u - aR);
-  double SR = d_fmax(L.u + aL, R.u + aR);
-
-  Cons FL = flux_x(UL);
-  Cons FR = flux_x(UR);
-
-  if (SL >= 0.0)
-    return FL;
-  if (SR <= 0.0)
-    return FR;
-
-  double rhoL = L.rho, rhoR = R.rho;
-  double uL = L.u, uR = R.u;
-  double pL = L.p, pR = R.p;
-
-  double num = pR - pL + rhoL * uL * (SL - uL) - rhoR * uR * (SR - uR);
-  double den = rhoL * (SL - uL) - rhoR * (SR - uR);
-
-  if (d_fabs(den) < 1e-14 || !isfinite(num) || !isfinite(den)) {
-    return hlle_x(UL, UR);
-  }
-
-  double SM = num / den;
-  if (!isfinite(SM))
-    return hlle_x(UL, UR);
-
-  double pStar = pL + rhoL * (SL - uL) * (SM - uL);
-  pStar = d_fmax(pStar, EPS_P);
-
-  double dLS = (SL - SM);
-  double dRS = (SR - SM);
-  if (d_fabs(dLS) < 1e-14 || d_fabs(dRS) < 1e-14) {
-    return hlle_x(UL, UR);
-  }
-
-  double rhoStarL = rhoL * (SL - uL) / dLS;
-  double rhoStarR = rhoR * (SR - uR) / dRS;
-
-  if (!(rhoStarL > 0.0) || !(rhoStarR > 0.0) || !isfinite(rhoStarL) ||
-      !isfinite(rhoStarR)) {
-    return hlle_x(UL, UR);
-  }
-
-  double mxStarL = rhoStarL * SM;
-  double myStarL = rhoStarL * L.v;
-  double EL = UL.E;
-  double EStarL = ((SL - uL) * EL - pL * uL + pStar * SM) / dLS;
-  if (!isfinite(EStarL))
-    return hlle_x(UL, UR);
-  Cons UStarL{rhoStarL, mxStarL, myStarL, EStarL};
-
-  double mxStarR = rhoStarR * SM;
-  double myStarR = rhoStarR * R.v;
-  double ER = UR.E;
-  double EStarR = ((SR - uR) * ER - pR * uR + pStar * SM) / dRS;
-  if (!isfinite(EStarR))
-    return hlle_x(UL, UR);
-  Cons UStarR{rhoStarR, mxStarR, myStarR, EStarR};
-
-  if (SM >= 0.0) {
-    Cons F;
-    F.rho = FL.rho + SL * (UStarL.rho - UL.rho);
-    F.mx = FL.mx + SL * (UStarL.mx - UL.mx);
-    F.my = FL.my + SL * (UStarL.my - UL.my);
-    F.E = FL.E + SL * (UStarL.E - UL.E);
-    return F;
-  } else {
-    Cons F;
-    F.rho = FR.rho + SR * (UStarR.rho - UR.rho);
-    F.mx = FR.mx + SR * (UStarR.mx - UR.mx);
-    F.my = FR.my + SR * (UStarR.my - UR.my);
-    F.E = FR.E + SR * (UStarR.E - UR.E);
-    return F;
-  }
+  return hllc_axis<Axis::X>(UL, UR);
 }
 
 __device__ __forceinline__ Cons hllc_x(Prim qL, Prim qR) {
-  Cons UL = prim_to_cons(qL);
-  Cons UR = prim_to_cons(qR);
-  return hllc_x(UL, UR);
+  return hllc_axis<Axis::X>(prim_to_cons(qL), prim_to_cons(qR));
 }
 
 __device__ __forceinline__ Cons hllc_y(Cons UL, Cons UR) {
-  Prim L = cons_to_prim(UL);
-  Prim R = cons_to_prim(UR);
-
-  double aL = sound_speed(L);
-  double aR = sound_speed(R);
-
-  double SL = d_fmin(L.v - aL, R.v - aR);
-  double SR = d_fmax(L.v + aL, R.v + aR);
-
-  Cons FL = flux_y(UL);
-  Cons FR = flux_y(UR);
-
-  if (SL >= 0.0)
-    return FL;
-  if (SR <= 0.0)
-    return FR;
-
-  double rhoL = L.rho, rhoR = R.rho;
-  double vL = L.v, vR = R.v;
-  double pL = L.p, pR = R.p;
-
-  double num = pR - pL + rhoL * vL * (SL - vL) - rhoR * vR * (SR - vR);
-  double den = rhoL * (SL - vL) - rhoR * (SR - vR);
-
-  if (d_fabs(den) < 1e-14 || !isfinite(num) || !isfinite(den)) {
-    return hlle_y(UL, UR);
-  }
-
-  double SM = num / den;
-  if (!isfinite(SM))
-    return hlle_y(UL, UR);
-
-  double pStar = pL + rhoL * (SL - vL) * (SM - vL);
-  pStar = d_fmax(pStar, EPS_P);
-
-  double dLS = (SL - SM);
-  double dRS = (SR - SM);
-  if (d_fabs(dLS) < 1e-14 || d_fabs(dRS) < 1e-14) {
-    return hlle_y(UL, UR);
-  }
-
-  double rhoStarL = rhoL * (SL - vL) / dLS;
-  double rhoStarR = rhoR * (SR - vR) / dRS;
-
-  if (!(rhoStarL > 0.0) || !(rhoStarR > 0.0) || !isfinite(rhoStarL) ||
-      !isfinite(rhoStarR)) {
-    return hlle_y(UL, UR);
-  }
-
-  double mxStarL = rhoStarL * L.u;
-  double myStarL = rhoStarL * SM;
-  double EL = UL.E;
-  double EStarL = ((SL - vL) * EL - pL * vL + pStar * SM) / dLS;
-  if (!isfinite(EStarL))
-    return hlle_y(UL, UR);
-  Cons UStarL{rhoStarL, mxStarL, myStarL, EStarL};
-
-  double mxStarR = rhoStarR * R.u;
-  double myStarR = rhoStarR * SM;
-  double ER = UR.E;
-  double EStarR = ((SR - vR) * ER - pR * vR + pStar * SM) / dRS;
-  if (!isfinite(EStarR))
-    return hlle_y(UL, UR);
-  Cons UStarR{rhoStarR, mxStarR, myStarR, EStarR};
-
-  if (SM >= 0.0) {
-    Cons F;
-    F.rho = FL.rho + SL * (UStarL.rho - UL.rho);
-    F.mx = FL.mx + SL * (UStarL.mx - UL.mx);
-    F.my = FL.my + SL * (UStarL.my - UL.my);
-    F.E = FL.E + SL * (UStarL.E - UL.E);
-    return F;
-  } else {
-    Cons F;
-    F.rho = FR.rho + SR * (UStarR.rho - UR.rho);
-    F.mx = FR.mx + SR * (UStarR.mx - UR.mx);
-    F.my = FR.my + SR * (UStarR.my - UR.my);
-    F.E = FR.E + SR * (UStarR.E - UR.E);
-    return F;
-  }
+  return hllc_axis<Axis::Y>(UL, UR);
 }
 
 __device__ __forceinline__ Cons hllc_y(Prim qB, Prim qT) {
-  Cons UL = prim_to_cons(qB);
-  Cons UR = prim_to_cons(qT);
-  return hllc_y(UL, UR);
+  return hllc_axis<Axis::Y>(prim_to_cons(qB), prim_to_cons(qT));
 }
 
 // device helpers
