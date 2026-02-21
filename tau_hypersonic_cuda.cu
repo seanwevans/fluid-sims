@@ -25,14 +25,16 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define W 1600
-#define H 512
 #define SCALE 1
+#define DEFAULT_WIDTH 1600
+#define DEFAULT_HEIGHT 512
 
 #define EPS_RHO 1e-25
 #define EPS_P 1e-25
 
 struct SimConfig {
+  int width;
+  int height;
   double gamma;
   double cfl;
   double visc_nu;
@@ -78,7 +80,9 @@ struct FacePrim {
 };
 
 // d_*
-__device__ __forceinline__ int d_idx(int x, int y) { return y * W + x; }
+__device__ __forceinline__ int d_idx(int x, int y) {
+  return y * d_cfg.width + x;
+}
 __device__ __forceinline__ double d_fmax(double a, double b) {
   return a > b ? a : b;
 }
@@ -228,14 +232,14 @@ __device__ __forceinline__ Cons neighbor_or_wall(const Usoa U,
 
   if (yn < 0)
     yn = 0;
-  if (yn >= H)
-    yn = H - 1;
+  if (yn >= d_cfg.height)
+    yn = d_cfg.height - 1;
 
   if (xn < 0) {
     return prim_to_cons(inflow_state());
   }
-  if (xn >= W) {
-    return load_cons(U, d_idx(W - 1, yn));
+  if (xn >= d_cfg.width) {
+    return load_cons(U, d_idx(d_cfg.width - 1, yn));
   }
 
   int j = d_idx(xn, yn);
@@ -250,14 +254,14 @@ __device__ __forceinline__ Cons neighbor_for_diff(const Usoa U,
                                                   int yc, int xn, int yn) {
   if (yn < 0)
     yn = 0;
-  if (yn >= H)
-    yn = H - 1;
+  if (yn >= d_cfg.height)
+    yn = d_cfg.height - 1;
 
   if (xn < 0) {
     return prim_to_cons(inflow_state());
   }
-  if (xn >= W) {
-    return load_cons(U, d_idx(W - 1, yn));
+  if (xn >= d_cfg.width) {
+    return load_cons(U, d_idx(d_cfg.width - 1, yn));
   }
 
   int j = d_idx(xn, yn);
@@ -620,13 +624,13 @@ __device__ __forceinline__ Prim sample_prim_bc(const Usoa U,
                                                int yc, int x, int y) {
   if (y < 0)
     y = 0;
-  if (y >= H)
-    y = H - 1;
+  if (y >= d_cfg.height)
+    y = d_cfg.height - 1;
 
   if (x < 0)
     return inflow_state();
-  if (x >= W) {
-    int i = d_idx(W - 1, y);
+  if (x >= d_cfg.width) {
+    int i = d_idx(d_cfg.width - 1, y);
     return cons_to_prim(load_cons(U, i));
   }
 
@@ -653,12 +657,12 @@ __device__ __forceinline__ double spherecone_xb(double Rb, double Rn,
 // k_*
 __global__ void k_init(Usoa U, uint8_t *mask) {
   int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-  int N = W * H;
+  int N = d_cfg.width * d_cfg.height;
   if (i >= N)
     return;
 
-  int x = i % W;
-  int y = i / W;
+  int x = i % d_cfg.width;
+  int y = i / d_cfg.width;
 
   double x0 = d_cfg.geom_x0;
   double cy = d_cfg.geom_cy;
@@ -685,7 +689,7 @@ __global__ void k_init(Usoa U, uint8_t *mask) {
 
 __global__ void k_apply_inflow_left(Usoa U, const uint8_t *mask) {
   int y = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-  if (y >= H)
+  if (y >= d_cfg.height)
     return;
 
   int i0 = d_idx(0, y);
@@ -701,7 +705,7 @@ __global__ void k_max_wavespeed_blocks(const Usoa U, const uint8_t *mask,
                                        double *blockMax) {
   __shared__ double smax[256];
   int tid = threadIdx.x;
-  int N = W * H;
+  int N = d_cfg.width * d_cfg.height;
 
   int i = (int)(blockIdx.x * blockDim.x + tid);
   double v = 1e-12;
@@ -766,7 +770,7 @@ __global__ void k_predict_face_states(Usoa U, const uint8_t *mask,
                                       double half_dt_dx,
                                       double half_dt_dy) {
   int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-  int N = W * H;
+  int N = d_cfg.width * d_cfg.height;
   if (i >= N)
     return;
 
@@ -779,8 +783,8 @@ __global__ void k_predict_face_states(Usoa U, const uint8_t *mask,
     return;
   }
 
-  int x = i % W;
-  int y = i / W;
+  int x = i % d_cfg.width;
+  int y = i / d_cfg.width;
 
   FacePrim fpCx = reconstruct_x(U, mask, x, y);
   Cons fpCx_L = prim_to_cons(fpCx.L);
@@ -825,17 +829,17 @@ __global__ void k_compute_xface_flux(Usoa U, const uint8_t *mask,
                                      Csoa xL_states, Csoa xR_states,
                                      Csoa xFlux) {
   int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-  int NF = (W + 1) * H;
+  int NF = (d_cfg.width + 1) * d_cfg.height;
   if (i >= NF)
     return;
 
-  int fx = i % (W + 1);
-  int y = i / (W + 1);
+  int fx = i % (d_cfg.width + 1);
+  int y = i / (d_cfg.width + 1);
   int xl = fx - 1;
   int xr = fx;
 
   bool hasL = (xl >= 0) && !mask[d_idx(xl, y)];
-  bool hasR = (xr < W) && !mask[d_idx(xr, y)];
+  bool hasR = (xr < d_cfg.width) && !mask[d_idx(xr, y)];
 
   Cons UL{}, UR{};
   if (hasL && hasR) {
@@ -859,17 +863,17 @@ __global__ void k_compute_yface_flux(Usoa U, const uint8_t *mask,
                                      Csoa yL_states, Csoa yR_states,
                                      Csoa yFlux) {
   int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-  int NF = W * (H + 1);
+  int NF = d_cfg.width * (d_cfg.height + 1);
   if (i >= NF)
     return;
 
-  int x = i % W;
-  int fy = i / W;
+  int x = i % d_cfg.width;
+  int fy = i / d_cfg.width;
   int yb = fy - 1;
   int yt = fy;
 
   bool hasB = (yb >= 0) && !mask[d_idx(x, yb)];
-  bool hasT = (yt < H) && !mask[d_idx(x, yt)];
+  bool hasT = (yt < d_cfg.height) && !mask[d_idx(x, yt)];
 
   Cons UB{}, UT{};
   if (hasB && hasT) {
@@ -892,7 +896,7 @@ __global__ void k_compute_yface_flux(Usoa U, const uint8_t *mask,
 __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, Csoa xFlux,
                        Csoa yFlux, double dt, double dt_dx, double dt_dy) {
   int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-  int N = W * H;
+  int N = d_cfg.width * d_cfg.height;
   if (i >= N)
     return;
 
@@ -901,13 +905,13 @@ __global__ void k_step(Usoa U, Usoa Uout, const uint8_t *mask, Csoa xFlux,
     return;
   }
 
-  int x = i % W;
-  int y = i / W;
+  int x = i % d_cfg.width;
+  int y = i / d_cfg.width;
 
-  Cons FxL = load_cons(xFlux, y * (W + 1) + x);
-  Cons FxR = load_cons(xFlux, y * (W + 1) + (x + 1));
-  Cons GyB = load_cons(yFlux, y * W + x);
-  Cons GyT = load_cons(yFlux, (y + 1) * W + x);
+  Cons FxL = load_cons(xFlux, y * (d_cfg.width + 1) + x);
+  Cons FxR = load_cons(xFlux, y * (d_cfg.width + 1) + (x + 1));
+  Cons GyB = load_cons(yFlux, y * d_cfg.width + x);
+  Cons GyT = load_cons(yFlux, (y + 1) * d_cfg.width + x);
 
   // Hyperbolic update
   Cons Uc = load_cons(U, i);
@@ -992,15 +996,15 @@ __global__ void k_render_vals(const Usoa U, const uint8_t *mask, int view_mode,
 
   int tid = threadIdx.x;
   int i = (int)(blockIdx.x * blockDim.x + tid);
-  int N = W * H;
+  int N = d_cfg.width * d_cfg.height;
 
   double v = 0.0;
   double mn = 1e300;
   double mx = -1e300;
 
   if (i < N && !mask[i]) {
-    int x = i % W;
-    int y = i / W;
+    int x = i % d_cfg.width;
+    int y = i / d_cfg.width;
 
     Prim p = cons_to_prim(load_cons(U, i));
 
@@ -1071,7 +1075,7 @@ __global__ void k_render_pixels(const uint8_t *mask, const double *tmpVal,
                                 const double *minv, const double *invRange,
                                 uchar4 *out) {
   int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-  int N = W * H;
+  int N = d_cfg.width * d_cfg.height;
   if (i >= N)
     return;
 
@@ -1200,16 +1204,18 @@ static inline void swap_Us(Usoa *a, Usoa *b) {
 
 static SimConfig default_config() {
   SimConfig cfg{};
+  cfg.width = DEFAULT_WIDTH;
+  cfg.height = DEFAULT_HEIGHT;
   cfg.gamma = 1.1;
   cfg.cfl = 0.25;
   cfg.visc_nu = 5e-2;
   cfg.visc_rho = 5e-2;
   cfg.visc_e = 2e-2;
   cfg.inflow_mach = 25.0;
-  cfg.geom_x0 = (double)W / 12.0;
-  cfg.geom_cy = (double)H / 2.0;
-  cfg.geom_Rb = (double)H / 12.0;
-  cfg.geom_Rn = (double)H / 24.0;
+  cfg.geom_x0 = (double)cfg.width / 12.0;
+  cfg.geom_cy = (double)cfg.height / 2.0;
+  cfg.geom_Rb = (double)cfg.height / 12.0;
+  cfg.geom_Rn = (double)cfg.height / 24.0;
   cfg.geom_theta = PI / 4.0;
   cfg.steps_per_frame = 2;
   return cfg;
@@ -1217,7 +1223,7 @@ static SimConfig default_config() {
 
 static void print_usage(const char *argv0) {
   fprintf(stderr,
-          "Usage: %s [--mach M] [--gamma G] [--cfl C] [--visc-nu NU]\n"
+          "Usage: %s [--width W] [--height H] [--mach M] [--gamma G] [--cfl C] [--visc-nu NU]\n"
           "          [--visc-rho MU] [--visc-e K] [--steps-per-frame N]\n"
           "          [--geom-x0 X0] [--geom-cy CY] [--geom-rb RB]\n"
           "          [--geom-rn RN] [--geom-theta THETA]\n",
@@ -1249,10 +1255,24 @@ static bool parse_int_flag(const char *name, const char *value, int *out) {
 
 static bool parse_args(int argc, char **argv, SimConfig *cfg) {
   const int max_steps_per_frame = 1024;
+  bool width_set = false;
+  bool height_set = false;
+  bool geom_x0_set = false;
+  bool geom_cy_set = false;
+  bool geom_rb_set = false;
+  bool geom_rn_set = false;
 
   for (int i = 1; i < argc; i++) {
     const char *arg = argv[i];
-    if (strcmp(arg, "--mach") == 0 && i + 1 < argc) {
+    if (strcmp(arg, "--width") == 0 && i + 1 < argc) {
+      if (!parse_int_flag(arg, argv[++i], &cfg->width))
+        return false;
+      width_set = true;
+    } else if (strcmp(arg, "--height") == 0 && i + 1 < argc) {
+      if (!parse_int_flag(arg, argv[++i], &cfg->height))
+        return false;
+      height_set = true;
+    } else if (strcmp(arg, "--mach") == 0 && i + 1 < argc) {
       if (!parse_double_flag(arg, argv[++i], &cfg->inflow_mach))
         return false;
     } else if (strcmp(arg, "--gamma") == 0 && i + 1 < argc) {
@@ -1276,15 +1296,19 @@ static bool parse_args(int argc, char **argv, SimConfig *cfg) {
     } else if (strcmp(arg, "--geom-x0") == 0 && i + 1 < argc) {
       if (!parse_double_flag(arg, argv[++i], &cfg->geom_x0))
         return false;
+      geom_x0_set = true;
     } else if (strcmp(arg, "--geom-cy") == 0 && i + 1 < argc) {
       if (!parse_double_flag(arg, argv[++i], &cfg->geom_cy))
         return false;
+      geom_cy_set = true;
     } else if (strcmp(arg, "--geom-rb") == 0 && i + 1 < argc) {
       if (!parse_double_flag(arg, argv[++i], &cfg->geom_Rb))
         return false;
+      geom_rb_set = true;
     } else if (strcmp(arg, "--geom-rn") == 0 && i + 1 < argc) {
       if (!parse_double_flag(arg, argv[++i], &cfg->geom_Rn))
         return false;
+      geom_rn_set = true;
     } else if (strcmp(arg, "--geom-theta") == 0 && i + 1 < argc) {
       if (!parse_double_flag(arg, argv[++i], &cfg->geom_theta))
         return false;
@@ -1292,6 +1316,23 @@ static bool parse_args(int argc, char **argv, SimConfig *cfg) {
       fprintf(stderr, "Unknown or incomplete argument: %s\n", arg);
       return false;
     }
+  }
+
+  if (cfg->width <= 0 || cfg->height <= 0) {
+    fprintf(stderr, "Invalid runtime dimensions: width=%d height=%d\n",
+            cfg->width, cfg->height);
+    return false;
+  }
+
+  if (width_set || height_set) {
+    if (!geom_x0_set)
+      cfg->geom_x0 = (double)cfg->width / 12.0;
+    if (!geom_cy_set)
+      cfg->geom_cy = (double)cfg->height / 2.0;
+    if (!geom_rb_set)
+      cfg->geom_Rb = (double)cfg->height / 12.0;
+    if (!geom_rn_set)
+      cfg->geom_Rn = (double)cfg->height / 24.0;
   }
 
   if (cfg->gamma <= 1.0 || cfg->cfl <= 0.0 || cfg->visc_nu < 0.0 ||
@@ -1308,6 +1349,7 @@ static bool parse_args(int argc, char **argv, SimConfig *cfg) {
 
 static void print_config(const SimConfig &cfg) {
   printf("SimConfig:\n");
+  printf("  width=%d height=%d\n", cfg.width, cfg.height);
   printf("  gamma=%.8g\n", cfg.gamma);
   printf("  cfl=%.8g\n", cfg.cfl);
   printf("  visc_nu=%.8g\n", cfg.visc_nu);
@@ -1329,16 +1371,16 @@ int main(int argc, char **argv) {
   print_config(h_cfg);
   CK(cudaMemcpyToSymbol(d_cfg, &h_cfg, sizeof(SimConfig)));
 
-  InitWindow(W * SCALE, H * SCALE, "Hypersonic 2D Flow");
+  InitWindow(h_cfg.width * SCALE, h_cfg.height * SCALE, "Hypersonic 2D Flow");
   SetTargetFPS(999);
 
-  const int N = W * H;
+  const int N = h_cfg.width * h_cfg.height;
   unsigned char *pixels = (unsigned char *)malloc((size_t)N * 4);
 
   Image img = {0};
   img.data = pixels;
-  img.width = W;
-  img.height = H;
+  img.width = h_cfg.width;
+  img.height = h_cfg.height;
   img.mipmaps = 1;
   img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
   Texture2D tex = LoadTextureFromImage(img);
@@ -1353,8 +1395,8 @@ int main(int argc, char **argv) {
   alloc_Cs(&dXStateR, N);
   alloc_Cs(&dYStateL, N);
   alloc_Cs(&dYStateR, N);
-  alloc_Cs(&dXFlux, (W + 1) * H);
-  alloc_Cs(&dYFlux, W * (H + 1));
+  alloc_Cs(&dXFlux, (h_cfg.width + 1) * h_cfg.height);
+  alloc_Cs(&dYFlux, h_cfg.width * (h_cfg.height + 1));
 
   uint8_t *dMask = nullptr;
   CK(cudaMalloc(&dMask, (size_t)N * sizeof(uint8_t)));
@@ -1367,8 +1409,8 @@ int main(int argc, char **argv) {
 
   const int threads = 256;
   const int blocksN = (N + threads - 1) / threads;
-  const int xFaceCount = (W + 1) * H;
-  const int yFaceCount = W * (H + 1);
+  const int xFaceCount = (h_cfg.width + 1) * h_cfg.height;
+  const int yFaceCount = h_cfg.width * (h_cfg.height + 1);
   const int blocksXFaces = (xFaceCount + threads - 1) / threads;
   const int blocksYFaces = (yFaceCount + threads - 1) / threads;
 
@@ -1412,7 +1454,7 @@ int main(int argc, char **argv) {
 
     if (!IsKeyDown(KEY_SPACE)) {
       for (int k = 0; k < h_cfg.steps_per_frame; k++) {
-        k_apply_inflow_left<<<(H + threads - 1) / threads, threads>>>(dU,
+        k_apply_inflow_left<<<(h_cfg.height + threads - 1) / threads, threads>>>(dU,
                                                                       dMask);
         CK(cudaGetLastError());
 
@@ -1505,8 +1547,8 @@ int main(int argc, char **argv) {
 
     BeginDrawing();
     ClearBackground(BLACK);
-    DrawTexturePro(tex, (Rectangle){0, 0, (float)W, (float)H},
-                   (Rectangle){0, 0, (float)(W * SCALE), (float)(H * SCALE)},
+    DrawTexturePro(tex, (Rectangle){0, 0, (float)h_cfg.width, (float)h_cfg.height},
+                   (Rectangle){0, 0, (float)(h_cfg.width * SCALE), (float)(h_cfg.height * SCALE)},
                    (Vector2){0, 0}, 0.0f, WHITE);
 
     DrawText(TextFormat("%.6f", sim_t), 10, 10, 20, WHITE);
