@@ -32,6 +32,8 @@
 #define EPS_RHO 1e-25
 #define EPS_P 1e-25
 
+constexpr double kPi = 3.14159265358979323846;
+
 struct SimConfig {
   double gamma;
   double cfl;
@@ -1210,7 +1212,7 @@ static SimConfig default_config() {
   cfg.geom_cy = (double)H / 2.0;
   cfg.geom_Rb = (double)H / 12.0;
   cfg.geom_Rn = (double)H / 24.0;
-  cfg.geom_theta = PI / 4.0;
+  cfg.geom_theta = kPi / 4.0;
   cfg.steps_per_frame = 2;
   return cfg;
 }
@@ -1298,7 +1300,7 @@ static bool parse_args(int argc, char **argv, SimConfig *cfg) {
       cfg->visc_rho < 0.0 || cfg->visc_e < 0.0 || cfg->inflow_mach <= 0.0 ||
       cfg->steps_per_frame <= 0 || cfg->steps_per_frame > max_steps_per_frame ||
       cfg->geom_Rb <= 0.0 || cfg->geom_Rn <= 0.0 ||
-      cfg->geom_theta <= 0.0 || cfg->geom_theta >= 0.5 * PI) {
+      cfg->geom_theta <= 0.0 || cfg->geom_theta >= 0.5 * kPi) {
     fprintf(stderr, "Invalid physical/geometry config values.\n");
     return false;
   }
