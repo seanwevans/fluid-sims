@@ -55,6 +55,14 @@ static inline void ck(cudaError_t e, const char *msg) {
 }
 #define CK(x) ck((x), #x)
 
+static inline bool ck_host(cudaError_t e, const char *msg) {
+  if (e != cudaSuccess) {
+    fprintf(stderr, "CUDA error: %s: %s\n", msg, cudaGetErrorString(e));
+    return false;
+  }
+  return true;
+}
+
 typedef struct {
   double *rho, *mx, *my, *E;
 } Usoa;
@@ -1231,6 +1239,30 @@ static void alloc_Us(Usoa *U, int N) {
   CK(cudaMalloc(&U->E, N * sizeof(double)));
 }
 
+static bool alloc_Us_host(Usoa *U, int N) {
+  if (!ck_host(cudaMalloc(&U->rho, N * sizeof(double)), "cudaMalloc(&U->rho)"))
+    return false;
+  if (!ck_host(cudaMalloc(&U->mx, N * sizeof(double)), "cudaMalloc(&U->mx)")) {
+    cudaFree(U->rho);
+    U->rho = nullptr;
+    return false;
+  }
+  if (!ck_host(cudaMalloc(&U->my, N * sizeof(double)), "cudaMalloc(&U->my)")) {
+    cudaFree(U->rho);
+    cudaFree(U->mx);
+    U->rho = U->mx = nullptr;
+    return false;
+  }
+  if (!ck_host(cudaMalloc(&U->E, N * sizeof(double)), "cudaMalloc(&U->E)")) {
+    cudaFree(U->rho);
+    cudaFree(U->mx);
+    cudaFree(U->my);
+    U->rho = U->mx = U->my = nullptr;
+    return false;
+  }
+  return true;
+}
+
 static void free_Us(Usoa *U) {
   cudaFree(U->rho);
   cudaFree(U->mx);
@@ -1374,19 +1406,50 @@ static void print_config(const SimConfig &cfg) {
 
 #ifndef TAU_HYPERSONIC_CUDA_NO_MAIN
 int main(int argc, char **argv) {
+#define CK_MAIN(stmt)                                                            \
+  do {                                                                           \
+    if (!ck_host((stmt), #stmt)) {                                               \
+      ret = 1;                                                                   \
+      goto cleanup;                                                              \
+    }                                                                            \
+  } while (0)
+
+  int ret = 0;
   SimConfig h_cfg = default_config();
   if (!parse_args(argc, argv, &h_cfg)) {
     print_usage(argv[0]);
     return 1;
   }
   print_config(h_cfg);
-  CK(cudaMemcpyToSymbol(d_cfg, &h_cfg, sizeof(SimConfig)));
+  CK_MAIN(cudaMemcpyToSymbol(d_cfg, &h_cfg, sizeof(SimConfig)));
+
+  bool window_inited = false;
+  bool texture_loaded = false;
+  Texture2D tex = {0};
+  unsigned char *pixels = nullptr;
+  Usoa dU{}, dUtmp{};
+  uint8_t *dMask = nullptr;
+  double *dTmpVal = nullptr;
+  uchar4 *dPixels = nullptr;
+  double *dBlockMin = nullptr;
+  double *dBlockMax = nullptr;
+  double *dReduceMin = nullptr;
+  double *dReduceMax = nullptr;
+  double *dInvRange = nullptr;
+  double *dMaxSpeed = nullptr;
+  double *dBlockSpeedMax = nullptr;
 
   InitWindow(W * SCALE, H * SCALE, "Hypersonic 2D Flow");
+  window_inited = true;
   SetTargetFPS(999);
 
   const int N = W * H;
-  unsigned char *pixels = (unsigned char *)malloc((size_t)N * 4);
+  pixels = (unsigned char *)malloc((size_t)N * 4);
+  if (!pixels) {
+    fprintf(stderr, "malloc failed for pixels\n");
+    ret = 1;
+    goto cleanup;
+  }
 
   Image img = {0};
   img.data = pixels;
@@ -1394,50 +1457,52 @@ int main(int argc, char **argv) {
   img.height = H;
   img.mipmaps = 1;
   img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
-  Texture2D tex = LoadTextureFromImage(img);
+  tex = LoadTextureFromImage(img);
+  texture_loaded = tex.id != 0;
 
-  Usoa dU{}, dUtmp{};
-  alloc_Us(&dU, N);
-  alloc_Us(&dUtmp, N);
+  if (!alloc_Us_host(&dU, N)) {
+    ret = 1;
+    goto cleanup;
+  }
+  if (!alloc_Us_host(&dUtmp, N)) {
+    ret = 1;
+    goto cleanup;
+  }
 
-  uint8_t *dMask = nullptr;
-  CK(cudaMalloc(&dMask, (size_t)N * sizeof(uint8_t)));
+  CK_MAIN(cudaMalloc(&dMask, (size_t)N * sizeof(uint8_t)));
 
-  double *dTmpVal = nullptr;
-  CK(cudaMalloc(&dTmpVal, (size_t)N * sizeof(double)));
+  CK_MAIN(cudaMalloc(&dTmpVal, (size_t)N * sizeof(double)));
 
-  uchar4 *dPixels = nullptr;
-  CK(cudaMalloc(&dPixels, (size_t)N * sizeof(uchar4)));
+  CK_MAIN(cudaMalloc(&dPixels, (size_t)N * sizeof(uchar4)));
 
   const int threads = 256;
   const int blocksN = (N + threads - 1) / threads;
 
-  double *dBlockMin = nullptr;
-  double *dBlockMax = nullptr;
-  CK(cudaMalloc(&dBlockMin, (size_t)blocksN * sizeof(double)));
-  CK(cudaMalloc(&dBlockMax, (size_t)blocksN * sizeof(double)));
+  CK_MAIN(cudaMalloc(&dBlockMin, (size_t)blocksN * sizeof(double)));
+  CK_MAIN(cudaMalloc(&dBlockMax, (size_t)blocksN * sizeof(double)));
 
-  double *dReduceMin = nullptr;
-  double *dReduceMax = nullptr;
-  CK(cudaMalloc(&dReduceMin, (size_t)blocksN * sizeof(double)));
-  CK(cudaMalloc(&dReduceMax, (size_t)blocksN * sizeof(double)));
+  CK_MAIN(cudaMalloc(&dReduceMin, (size_t)blocksN * sizeof(double)));
+  CK_MAIN(cudaMalloc(&dReduceMax, (size_t)blocksN * sizeof(double)));
 
-  double *dInvRange = nullptr;
-  CK(cudaMalloc(&dInvRange, sizeof(double)));
+  CK_MAIN(cudaMalloc(&dInvRange, sizeof(double)));
 
-  double *dMaxSpeed = nullptr;
-  CK(cudaMalloc(&dMaxSpeed, sizeof(double)));
+  CK_MAIN(cudaMalloc(&dMaxSpeed, sizeof(double)));
 
-  double *dBlockSpeedMax = nullptr;
-  CK(cudaMalloc(&dBlockSpeedMax, (size_t)blocksN * sizeof(double)));
+  CK_MAIN(cudaMalloc(&dBlockSpeedMax, (size_t)blocksN * sizeof(double)));
 
-  auto gpu_init = [&]() {
+  auto gpu_init = [&]() -> bool {
     k_init<<<blocksN, threads>>>(dU, dMask);
-    CK(cudaGetLastError());
-    CK(cudaDeviceSynchronize());
+    if (!ck_host(cudaGetLastError(), "cudaGetLastError()"))
+      return false;
+    if (!ck_host(cudaDeviceSynchronize(), "cudaDeviceSynchronize()"))
+      return false;
+    return true;
   };
 
-  gpu_init();
+  if (!gpu_init()) {
+    ret = 1;
+    goto cleanup;
+  }
 
   double sim_t = 0.0;
   int view_mode = 3;
@@ -1445,7 +1510,10 @@ int main(int argc, char **argv) {
   while (!WindowShouldClose()) {
     if (IsKeyPressed(KEY_R)) {
       sim_t = 0.0;
-      gpu_init();
+      if (!gpu_init()) {
+        ret = 1;
+        goto cleanup;
+      }
     }
     if (IsKeyPressed(KEY_M))
       view_mode = (view_mode + 1) % 7;
@@ -1454,19 +1522,19 @@ int main(int argc, char **argv) {
       for (int k = 0; k < h_cfg.steps_per_frame; k++) {
         k_apply_inflow_left<<<(H + threads - 1) / threads, threads>>>(dU,
                                                                       dMask);
-        CK(cudaGetLastError());
+        CK_MAIN(cudaGetLastError());
 
         // Two-stage GPU reduction to a single max wavespeed.
         k_max_wavespeed_blocks<<<blocksN, threads>>>(dU, dMask,
                                                      dBlockSpeedMax);
-        CK(cudaGetLastError());
+        CK_MAIN(cudaGetLastError());
         k_reduce_block_max<<<1, threads>>>(dBlockSpeedMax, blocksN, dMaxSpeed);
-        CK(cudaGetLastError());
-        CK(cudaDeviceSynchronize());
+        CK_MAIN(cudaGetLastError());
+        CK_MAIN(cudaDeviceSynchronize());
 
         double maxs = 1e-12;
-        CK(cudaMemcpy(&maxs, dMaxSpeed, sizeof(double),
-                      cudaMemcpyDeviceToHost));
+        CK_MAIN(cudaMemcpy(&maxs, dMaxSpeed, sizeof(double),
+                           cudaMemcpyDeviceToHost));
         if (!isfinite(maxs) || maxs < 1e-12)
           maxs = 1e-12;
 
@@ -1478,8 +1546,8 @@ int main(int argc, char **argv) {
 
         k_step<<<blocksN, threads>>>(dU, dUtmp, dMask, dt, dt_dx, dt_dy,
                                      half_dt_dx, half_dt_dy);
-        CK(cudaGetLastError());
-        CK(cudaDeviceSynchronize());
+        CK_MAIN(cudaGetLastError());
+        CK_MAIN(cudaDeviceSynchronize());
 
         // Ping-pong swap (removes k_copy full-grid copy)
         swap_Us(&dU, &dUtmp);
@@ -1491,8 +1559,8 @@ int main(int argc, char **argv) {
     // render pass A: vals + per-block min/max
     k_render_vals<<<blocksN, threads>>>(dU, dMask, view_mode, dTmpVal,
                                         dBlockMin, dBlockMax);
-    CK(cudaGetLastError());
-    CK(cudaDeviceSynchronize());
+    CK_MAIN(cudaGetLastError());
+    CK_MAIN(cudaDeviceSynchronize());
 
     const double *curMin = dBlockMin;
     const double *curMax = dBlockMax;
@@ -1502,7 +1570,7 @@ int main(int argc, char **argv) {
     while (curN > 1) {
       int outN = (curN + (2 * threads - 1)) / (2 * threads);
       k_reduce_minmax<<<outN, threads>>>(curMin, curMax, outMin, outMax, curN);
-      CK(cudaGetLastError());
+      CK_MAIN(cudaGetLastError());
       curN = outN;
       const double *nextMin = outMin;
       const double *nextMax = outMax;
@@ -1512,16 +1580,16 @@ int main(int argc, char **argv) {
       curMax = nextMax;
     }
     k_compute_inv_range<<<1, 1>>>(curMin, curMax, dInvRange);
-    CK(cudaGetLastError());
+    CK_MAIN(cudaGetLastError());
 
     // render pass B: pixels
     k_render_pixels<<<blocksN, threads>>>(dMask, dTmpVal, curMin, dInvRange,
                                           dPixels);
-    CK(cudaGetLastError());
-    CK(cudaDeviceSynchronize());
+    CK_MAIN(cudaGetLastError());
+    CK_MAIN(cudaDeviceSynchronize());
 
-    CK(cudaMemcpy(pixels, dPixels, (size_t)N * sizeof(uchar4),
-                  cudaMemcpyDeviceToHost));
+    CK_MAIN(cudaMemcpy(pixels, dPixels, (size_t)N * sizeof(uchar4),
+                       cudaMemcpyDeviceToHost));
     UpdateTexture(tex, pixels);
 
     BeginDrawing();
@@ -1544,7 +1612,11 @@ int main(int argc, char **argv) {
     EndDrawing();
   }
 
-  CloseWindow();
+cleanup:
+  if (texture_loaded)
+    UnloadTexture(tex);
+  if (window_inited)
+    CloseWindow();
 
   free(pixels);
 
@@ -1562,6 +1634,8 @@ int main(int argc, char **argv) {
   free_Us(&dU);
   free_Us(&dUtmp);
 
-  return 0;
+  return ret;
+
+#undef CK_MAIN
 }
 #endif
