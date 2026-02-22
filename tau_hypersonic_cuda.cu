@@ -49,6 +49,21 @@ struct SimConfig {
   int steps_per_frame;
 };
 
+struct TileCliConfig {
+  int tile_bx;
+  int tile_by;
+  bool tile_bx_set;
+  bool tile_by_set;
+};
+
+struct TileLaunchConfig {
+  dim3 block;
+  dim3 grid;
+  size_t shm_predict;
+  size_t shm_step;
+  const char *preset_name;
+};
+
 __constant__ SimConfig d_cfg;
 
 static inline void ck(cudaError_t e, const char *msg) {
@@ -1399,12 +1414,50 @@ static SimConfig default_config() {
   return cfg;
 }
 
+static TileCliConfig default_tile_cli_config() {
+  TileCliConfig cfg{};
+  cfg.tile_bx = -1;
+  cfg.tile_by = -1;
+  cfg.tile_bx_set = false;
+  cfg.tile_by_set = false;
+  return cfg;
+}
+
+static TileCliConfig tile_preset_for_device(const cudaDeviceProp &prop) {
+  TileCliConfig cfg{};
+  cfg.tile_bx = 32;
+  cfg.tile_by = 4;
+
+  if (prop.major >= 9) {
+    cfg.tile_bx = 32;
+    cfg.tile_by = 8;
+  } else if (prop.major >= 8) {
+    cfg.tile_bx = 32;
+    cfg.tile_by = 6;
+  } else if (prop.major >= 7) {
+    cfg.tile_bx = 32;
+    cfg.tile_by = 4;
+  } else {
+    cfg.tile_bx = 16;
+    cfg.tile_by = 8;
+  }
+
+  const int max_threads = prop.maxThreadsPerBlock > 0 ? prop.maxThreadsPerBlock
+                                                       : 1024;
+  while (cfg.tile_bx * cfg.tile_by > max_threads && cfg.tile_by > 1) {
+    cfg.tile_by /= 2;
+  }
+
+  return cfg;
+}
+
 static void print_usage(const char *argv0) {
   fprintf(stderr,
           "Usage: %s [--mach M] [--gamma G] [--cfl C] [--visc-nu NU]\n"
           "          [--visc-rho MU] [--visc-e K] [--steps-per-frame N]\n"
           "          [--geom-x0 X0] [--geom-cy CY] [--geom-rb RB]\n"
-          "          [--geom-rn RN] [--geom-theta THETA]\n",
+          "          [--geom-rn RN] [--geom-theta THETA]\n"
+          "          [--tile-bx BX] [--tile-by BY]\n",
           argv0);
 }
 
@@ -1432,7 +1485,8 @@ static bool parse_int_flag(const char *name, const char *value, int *out) {
   return true;
 }
 
-static bool parse_args(int argc, char **argv, SimConfig *cfg) {
+static bool parse_args(int argc, char **argv, SimConfig *cfg,
+                       TileCliConfig *tile_cfg) {
   const int max_steps_per_frame = 1024;
 
   for (int i = 1; i < argc; i++) {
@@ -1473,6 +1527,14 @@ static bool parse_args(int argc, char **argv, SimConfig *cfg) {
     } else if (strcmp(arg, "--geom-theta") == 0 && i + 1 < argc) {
       if (!parse_double_flag(arg, argv[++i], &cfg->geom_theta))
         return false;
+    } else if (strcmp(arg, "--tile-bx") == 0 && i + 1 < argc) {
+      if (!parse_int_flag(arg, argv[++i], &tile_cfg->tile_bx))
+        return false;
+      tile_cfg->tile_bx_set = true;
+    } else if (strcmp(arg, "--tile-by") == 0 && i + 1 < argc) {
+      if (!parse_int_flag(arg, argv[++i], &tile_cfg->tile_by))
+        return false;
+      tile_cfg->tile_by_set = true;
     } else {
       fprintf(stderr, "Unknown or incomplete argument: %s\n", arg);
       return false;
@@ -1572,10 +1634,65 @@ static bool parse_args(int argc, char **argv, SimConfig *cfg) {
     return false;
   }
 
+  if ((tile_cfg->tile_bx_set && tile_cfg->tile_bx <= 0) ||
+      (tile_cfg->tile_by_set && tile_cfg->tile_by <= 0)) {
+    fprintf(stderr,
+            "Invalid tile dimensions: --tile-bx and --tile-by must be "
+            "positive when provided.\n");
+    return false;
+  }
+
   return true;
 }
 
-static void print_config(const SimConfig &cfg) {
+static bool make_tile_launch_config(const TileCliConfig &cli_cfg,
+                                    const cudaDeviceProp &prop,
+                                    TileLaunchConfig *launch) {
+  const TileCliConfig preset = tile_preset_for_device(prop);
+  const int bx = cli_cfg.tile_bx > 0 ? cli_cfg.tile_bx : preset.tile_bx;
+  const int by = cli_cfg.tile_by > 0 ? cli_cfg.tile_by : preset.tile_by;
+
+  if (bx <= 0 || by <= 0) {
+    fprintf(stderr, "Invalid tile dimensions bx=%d by=%d.\n", bx, by);
+    return false;
+  }
+
+  const int threads_per_block = bx * by;
+  if (threads_per_block > prop.maxThreadsPerBlock) {
+    fprintf(stderr,
+            "Invalid tile dimensions (%d x %d): %d threads/block exceeds "
+            "device maxThreadsPerBlock=%d.\n",
+            bx, by, threads_per_block, prop.maxThreadsPerBlock);
+    return false;
+  }
+
+  const size_t tileCellsPredict = (size_t)(bx + 2) * (size_t)(by + 2);
+  const size_t tileCellsStep = (size_t)(bx + 4) * (size_t)(by + 4);
+  const size_t shmPredict = 4 * tileCellsPredict * sizeof(double) +
+                            tileCellsPredict * sizeof(uint8_t);
+  const size_t shmStep =
+      4 * tileCellsStep * sizeof(double) + tileCellsStep * sizeof(uint8_t);
+  const size_t shared_limit = (size_t)prop.sharedMemPerBlock;
+
+  if (shmPredict > shared_limit || shmStep > shared_limit) {
+    fprintf(stderr,
+            "Invalid tile dimensions (%d x %d): shared memory requires "
+            "predict=%zu bytes, step=%zu bytes, device limit=%zu bytes.\n",
+            bx, by, shmPredict, shmStep, shared_limit);
+    return false;
+  }
+
+  launch->block = dim3((unsigned int)bx, (unsigned int)by);
+  launch->grid = dim3((W + bx - 1) / bx, (H + by - 1) / by);
+  launch->shm_predict = shmPredict;
+  launch->shm_step = shmStep;
+  launch->preset_name =
+      (cli_cfg.tile_bx_set || cli_cfg.tile_by_set) ? "cli" : "device-preset";
+  return true;
+}
+
+static void print_config(const SimConfig &cfg, const TileLaunchConfig &tile_cfg,
+                         const cudaDeviceProp &prop) {
   printf("SimConfig:\n");
   printf("  gamma=%.8g\n", cfg.gamma);
   printf("  cfl=%.8g\n", cfg.cfl);
@@ -1587,16 +1704,38 @@ static void print_config(const SimConfig &cfg) {
   printf(
       "  geom_x0=%.8g geom_cy=%.8g geom_Rb=%.8g geom_Rn=%.8g geom_theta=%.8g\n",
       cfg.geom_x0, cfg.geom_cy, cfg.geom_Rb, cfg.geom_Rn, cfg.geom_theta);
+  printf("LaunchConfig:\n");
+  printf("  device=%s sm=%d.%d maxThreadsPerBlock=%d sharedMemPerBlock=%zu\n",
+         prop.name, prop.major, prop.minor, prop.maxThreadsPerBlock,
+         (size_t)prop.sharedMemPerBlock);
+  printf("  tile_block=(%u,%u) grid=(%u,%u) source=%s\n", tile_cfg.block.x,
+         tile_cfg.block.y, tile_cfg.grid.x, tile_cfg.grid.y,
+         tile_cfg.preset_name);
+  printf("  dynamic_shared_bytes: predict=%zu step=%zu\n",
+         tile_cfg.shm_predict, tile_cfg.shm_step);
 }
 
 #ifndef TAU_HYPERSONIC_CUDA_NO_MAIN
 int main(int argc, char **argv) {
   SimConfig h_cfg = default_config();
-  if (!parse_args(argc, argv, &h_cfg)) {
+  TileCliConfig tile_cli_cfg = default_tile_cli_config();
+  if (!parse_args(argc, argv, &h_cfg, &tile_cli_cfg)) {
     print_usage(argv[0]);
     return 1;
   }
-  print_config(h_cfg);
+
+  int dev = 0;
+  CK(cudaGetDevice(&dev));
+  cudaDeviceProp prop{};
+  CK(cudaGetDeviceProperties(&prop, dev));
+
+  TileLaunchConfig tile_launch_cfg{};
+  if (!make_tile_launch_config(tile_cli_cfg, prop, &tile_launch_cfg)) {
+    print_usage(argv[0]);
+    return 1;
+  }
+
+  print_config(h_cfg, tile_launch_cfg, prop);
   CK(cudaMemcpyToSymbol(d_cfg, &h_cfg, sizeof(SimConfig)));
 
   InitWindow(W * SCALE, H * SCALE, "Hypersonic 2D Flow");
@@ -1646,17 +1785,10 @@ int main(int argc, char **argv) {
   const int blocksXFaces = (xFaceCount + threads - 1) / threads;
   const int blocksYFaces = (yFaceCount + threads - 1) / threads;
 
-  const dim3 tileBlock(32, 4);
-  const dim3 blocksNTiled((W + tileBlock.x - 1) / tileBlock.x,
-                          (H + tileBlock.y - 1) / tileBlock.y);
-  const size_t tileCellsPredict =
-      (size_t)(tileBlock.x + 2) * (size_t)(tileBlock.y + 2);
-  const size_t tileCellsStep =
-      (size_t)(tileBlock.x + 4) * (size_t)(tileBlock.y + 4);
-  const size_t shmPredict = 4 * tileCellsPredict * sizeof(double) +
-                            tileCellsPredict * sizeof(uint8_t);
-  const size_t shmStep =
-      4 * tileCellsStep * sizeof(double) + tileCellsStep * sizeof(uint8_t);
+  const dim3 tileBlock = tile_launch_cfg.block;
+  const dim3 blocksNTiled = tile_launch_cfg.grid;
+  const size_t shmPredict = tile_launch_cfg.shm_predict;
+  const size_t shmStep = tile_launch_cfg.shm_step;
 
   double *dBlockMin = nullptr;
   double *dBlockMax = nullptr;
