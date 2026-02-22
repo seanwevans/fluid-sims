@@ -188,7 +188,8 @@ __device__ inline float sdf_sphere(float x, float y, float z) {
   return sqrtf(dx * dx + dy * dy + dz * dz) - P.sdf_r;
 }
 
-__device__ inline bool cell_is_solid(const uint8_t *solid, int x, int y, int z) {
+__device__ inline bool cell_is_solid(const uint8_t *solid, int x, int y,
+                                     int z) {
   if (x >= 0 && x < P.nx && y >= 0 && y < P.ny && z >= 0 && z < P.nz)
     return solid[idx3(x, y, z)] != 0;
 
@@ -320,7 +321,7 @@ __device__ inline float axis_velocity(const Prim &q, int axis) {
 }
 
 __device__ inline float axis_crossflow_speed(const Prim &L, const Prim &R,
-                                              int axis) {
+                                             int axis) {
   if (axis == 0)
     return (fabsf(L.v) + fabsf(R.v) + fabsf(L.w) + fabsf(R.w)) * 0.5f;
   if (axis == 1)
@@ -623,13 +624,9 @@ __device__ inline Prim inflow_prim() {
   return q;
 }
 
-__device__ inline Prim outflow_prim_characteristic(const float *xi,
-                                                   const float *phix,
-                                                   const float *phiy,
-                                                   const float *phiz,
-                                                   const float *lam,
-                                                   const float *zet,
-                                                   int xghost, int y, int z) {
+__device__ inline Prim outflow_prim_characteristic(
+    const float *xi, const float *phix, const float *phiy, const float *phiz,
+    const float *lam, const float *zet, int xghost, int y, int z) {
   // nearest interior boundary state and one-cell-upwind state for
   // extrapolation slope
   int iR = idx3(P.nx - 1, y, z);
@@ -669,10 +666,10 @@ __device__ inline Prim outflow_prim_characteristic(const float *xi,
 
   float L1 = 0.5f * (dp / (a_ref * a_ref) - rho_ref * du / a_ref); // u-a
   float L5 = 0.5f * (dp / (a_ref * a_ref) + rho_ref * du / a_ref); // u+a
-  float L2 = drho - dp / (a_ref * a_ref);                           // u
-  float L3 = qEx.v - qT.v;                                          // u
-  float L4 = qEx.w - qT.w;                                          // u
-  float L6 = qEx.ev - qT.ev;                                        // u
+  float L2 = drho - dp / (a_ref * a_ref);                          // u
+  float L3 = qEx.v - qT.v;                                         // u
+  float L4 = qEx.w - qT.w;                                         // u
+  float L6 = qEx.ev - qT.ev;                                       // u
 
   if (un - a_ref < 0.f)
     L1 = 0.f;
@@ -714,8 +711,7 @@ __device__ inline Prim prim_at_xbc(const float *xi, const float *phix,
   }
 
   if (x >= P.nx)
-    return outflow_prim_characteristic(xi, phix, phiy, phiz, lam, zet, x, y,
-                                       z);
+    return outflow_prim_characteristic(xi, phix, phiy, phiz, lam, zet, x, y, z);
 
   int i = idx3(x, y, z);
   Prim q = log_to_prim(xi[i], phix[i], phiy[i], phiz[i], lam[i], zet[i]);
@@ -1132,7 +1128,8 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
   Prim q1 = cons_to_prim(U1);
 
   float ev_eq = evib_eq(q1.T);
-  q1.ev = fmaxf(q1.ev + (ev_eq - q1.ev) * (dt / fmaxf(P.tau_vib, TAU_VIB_MIN)), 0.f);
+  q1.ev = fmaxf(q1.ev + (ev_eq - q1.ev) * (dt / fmaxf(P.tau_vib, TAU_VIB_MIN)),
+                0.f);
   q1.Tv = Tv_from_evib_seed(q1.ev, q1.T);
 
   // Sponge near inflow boundary (x small): gently relax toward ramped inflow
@@ -1165,10 +1162,10 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
   }
 
   float a = soundspeed(q1);
-  float sx = (fabsf(q1.u) + a) / P.dx;
-  float sy = (fabsf(q1.v) + a) / P.dy;
-  float sz = (fabsf(q1.w) + a) / P.dz;
-  atomicMaxFloat(g_maxwavespeed, sx + sy + sz);
+  float ssx = (fabsf(q1.u) + a) / P.dx;
+  float ssy = (fabsf(q1.v) + a) / P.dy;
+  float ssz = (fabsf(q1.w) + a) / P.dz;
+  atomicMaxFloat(g_maxwavespeed, ssx + ssy + ssz);
 
   xi2[i] = xi_from_rho(q1.r);
   phix2[i] = phi_from_vel(q1.u);
@@ -1189,8 +1186,8 @@ __global__ void k_schlieren(const float *xi, float *out) {
   int ym = wrapi(y - 1, P.ny), yp = wrapi(y + 1, P.ny);
   int zm = wrapi(z - 1, P.nz), zp = wrapi(z + 1, P.nz);
 
-  float rxm = (xm < 0) ? fmaxf(P.inflow_r, 1e-30f)
-                       : rho_from_xi(xi[idx3(xm, y, z)]);
+  float rxm =
+      (xm < 0) ? fmaxf(P.inflow_r, 1e-30f) : rho_from_xi(xi[idx3(xm, y, z)]);
   float rxp = (xp >= P.nx) ? rho_from_xi(xi[idx3(P.nx - 1, y, z)])
                            : rho_from_xi(xi[idx3(xp, y, z)]);
   float rym = rho_from_xi(xi[idx3(x, ym, z)]);
@@ -1208,8 +1205,7 @@ __global__ void k_schlieren(const float *xi, float *out) {
 
 __global__ void k_outflow_reflection_metric(const float *xi, const float *phix,
                                             const float *phiy,
-                                            const float *phiz,
-                                            const float *lam,
+                                            const float *phiz, const float *lam,
                                             const float *zet, float *g_max_dp,
                                             int nprobe) {
   int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
@@ -1318,8 +1314,8 @@ static void camera_orbit_pan_zoom(Camera3D *cam) {
 }
 
 static void reset_sim(dim3 grid, dim3 block, float *d_xi, float *d_phix,
-                      float *d_phiy, float *d_phiz, float *d_lam,
-                      float *d_zet, const uint8_t *d_solid) {
+                      float *d_phiy, float *d_phiz, float *d_lam, float *d_zet,
+                      const uint8_t *d_solid) {
   k_init<<<grid, block>>>(d_xi, d_phix, d_phiy, d_phiz, d_lam, d_zet, d_solid);
   ck(cudaGetLastError(), "k_init launch");
   ck(cudaDeviceSynchronize(), "k_init sync");
@@ -1412,8 +1408,7 @@ int main() {
             (hp.nz + block.z - 1) / block.z);
   size_t k_step_smem =
       (size_t)(block.x + 2 * WENO_HALO) * (size_t)(block.y + 2 * WENO_HALO) *
-      (size_t)(block.z + 2 * WENO_HALO) *
-      (6 * sizeof(float) + sizeof(uint8_t));
+      (size_t)(block.z + 2 * WENO_HALO) * (6 * sizeof(float) + sizeof(uint8_t));
   ck(cudaFuncSetAttribute(k_step, cudaFuncAttributeMaxDynamicSharedMemorySize,
                           (int)k_step_smem),
      "k_step shared-memory attribute");
@@ -1459,7 +1454,7 @@ int main() {
   bool paused = false;
   bool log_scale = true;
   float a_gain = 0.55f; // opacity
-  int z_stride = 1; // 1=all slices, 2=half, 3=third
+  int z_stride = 1;     // 1=all slices, 2=half, 3=third
   const int steps_per_frame = 2;
 
   while (!WindowShouldClose()) {
@@ -1506,10 +1501,9 @@ int main() {
         ck(cudaMemcpy(d_maxs, &zero, sizeof(float), cudaMemcpyHostToDevice),
            "set maxs");
 
-        k_step<<<grid, block, k_step_smem>>>(d_xi, d_phix, d_phiy, d_phiz,
-                                              d_lam, d_zet, d_xi2, d_phix2,
-                                              d_phiy2, d_phiz2, d_lam2, d_zet2,
-                                              dt, inflow_gain, d_maxs, d_solid);
+        k_step<<<grid, block, k_step_smem>>>(
+            d_xi, d_phix, d_phiy, d_phiz, d_lam, d_zet, d_xi2, d_phix2, d_phiy2,
+            d_phiz2, d_lam2, d_zet2, dt, inflow_gain, d_maxs, d_solid);
         ck(cudaGetLastError(), "k_step launch");
 
         ck(cudaMemcpy(&maxs, d_maxs, sizeof(float), cudaMemcpyDeviceToHost),
@@ -1530,8 +1524,8 @@ int main() {
       }
     }
 
-    k_vis<<<grid, block>>>(d_xi, d_phix, d_phiy, d_phiz, d_lam, d_zet,
-                           d_solid, d_vis, vis_mode);
+    k_vis<<<grid, block>>>(d_xi, d_phix, d_phiy, d_phiz, d_lam, d_zet, d_solid,
+                           d_vis, vis_mode);
     ck(cudaGetLastError(), "k_vis launch");
     ck(cudaDeviceSynchronize(), "vis sync");
 
@@ -1543,8 +1537,8 @@ int main() {
       float zero = 0.f;
       ck(cudaMemcpy(d_reflect, &zero, sizeof(float), cudaMemcpyHostToDevice),
          "set reflect metric");
-      k_outflow_reflection_metric<<<grid, block>>>(
-          d_xi, d_phix, d_phiy, d_phiz, d_lam, d_zet, d_reflect, 6);
+      k_outflow_reflection_metric<<<grid, block>>>(d_xi, d_phix, d_phiy, d_phiz,
+                                                   d_lam, d_zet, d_reflect, 6);
       ck(cudaGetLastError(), "k_outflow_reflection_metric launch");
       ck(cudaMemcpy(&refl_dp, d_reflect, sizeof(float), cudaMemcpyDeviceToHost),
          "get reflect metric");
