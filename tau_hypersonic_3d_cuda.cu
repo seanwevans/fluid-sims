@@ -641,6 +641,80 @@ __device__ inline Prim inflow_prim() {
   return q;
 }
 
+__device__ inline Prim outflow_prim_characteristic(const float *xi,
+                                                   const float *phix,
+                                                   const float *phiy,
+                                                   const float *phiz,
+                                                   const float *lam,
+                                                   const float *zet,
+                                                   int xghost, int y, int z) {
+  // nearest interior boundary state and one-cell-upwind state for
+  // extrapolation slope
+  int iR = idx3(P.nx - 1, y, z);
+  Prim qR = log_to_prim(xi[iR], phix[iR], phiy[iR], phiz[iR], lam[iR], zet[iR]);
+
+  Prim qL = qR;
+  if (P.nx > 1) {
+    int iL = idx3(P.nx - 2, y, z);
+    qL = log_to_prim(xi[iL], phix[iL], phiy[iL], phiz[iL], lam[iL], zet[iL]);
+  }
+
+  int g = xghost - (P.nx - 1);
+  float gf = (float)g;
+
+  Prim qEx{};
+  qEx.r = fmaxf(qR.r + gf * (qR.r - qL.r), RHO_P_FLOOR);
+  qEx.u = qR.u + gf * (qR.u - qL.u);
+  qEx.v = qR.v + gf * (qR.v - qL.v);
+  qEx.w = qR.w + gf * (qR.w - qL.w);
+  qEx.p = fmaxf(qR.p + gf * (qR.p - qL.p), RHO_P_FLOOR);
+  qEx.T = qEx.p / (qEx.r * P.R);
+  qEx.ev = fmaxf(qR.ev + gf * (qR.ev - qL.ev), 0.f);
+  qEx.Tv = Tv_from_evib_seed(qEx.ev, qEx.T);
+
+  // far-field target used for incoming characteristics
+  Prim qT = inflow_prim();
+
+  float rho_ref = fmaxf(qR.r, RHO_P_FLOOR);
+  float a_ref = soundspeed(qR);
+  float un = qR.u; // x-normal velocity at outflow
+
+  // primitive perturbation relative to target, projected to 1D Euler
+  // characteristics in x.
+  float drho = qEx.r - qT.r;
+  float du = qEx.u - qT.u;
+  float dp = qEx.p - qT.p;
+
+  float L1 = 0.5f * (dp / (a_ref * a_ref) - rho_ref * du / a_ref); // u-a
+  float L5 = 0.5f * (dp / (a_ref * a_ref) + rho_ref * du / a_ref); // u+a
+  float L2 = drho - dp / (a_ref * a_ref);                           // u
+  float L3 = qEx.v - qT.v;                                          // u
+  float L4 = qEx.w - qT.w;                                          // u
+  float L6 = qEx.ev - qT.ev;                                        // u
+
+  if (un - a_ref < 0.f)
+    L1 = 0.f;
+  if (un < 0.f) {
+    L2 = 0.f;
+    L3 = 0.f;
+    L4 = 0.f;
+    L6 = 0.f;
+  }
+  if (un + a_ref < 0.f)
+    L5 = 0.f;
+
+  Prim q{};
+  q.r = fmaxf(qT.r + L1 + L2 + L5, RHO_P_FLOOR);
+  q.u = qT.u + (L5 - L1) / fmaxf(rho_ref * a_ref, DENOM_EPS);
+  q.p = fmaxf(qT.p + a_ref * a_ref * (L1 + L5), RHO_P_FLOOR);
+  q.v = qT.v + L3;
+  q.w = qT.w + L4;
+  q.T = q.p / (q.r * P.R);
+  q.ev = fmaxf(qT.ev + L6, 0.f);
+  q.Tv = Tv_from_evib_seed(q.ev, q.T);
+  return q;
+}
+
 __device__ inline Prim prim_at_xbc(const float *xi, const float *phix,
                                    const float *phiy, const float *phiz,
                                    const float *lam, const float *zet,
@@ -658,7 +732,8 @@ __device__ inline Prim prim_at_xbc(const float *xi, const float *phix,
   }
 
   if (x >= P.nx)
-    x = P.nx - 1; // outflow: zero-gradient clamp
+    return outflow_prim_characteristic(xi, phix, phiy, phiz, lam, zet, x, y,
+                                       z);
 
   int i = idx3(x, y, z);
   Prim q = log_to_prim(xi[i], phix[i], phiy[i], phiz[i], lam[i], zet[i]);
@@ -1074,6 +1149,28 @@ __global__ void k_schlieren(const float *xi, float *out) {
   out[idx3(x, y, z)] = g;
 }
 
+__global__ void k_outflow_reflection_metric(const float *xi, const float *phix,
+                                            const float *phiy,
+                                            const float *phiz,
+                                            const float *lam,
+                                            const float *zet, float *g_max_dp,
+                                            int nprobe) {
+  int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+  int z = (int)(blockIdx.z * blockDim.z + threadIdx.z);
+  if (x >= P.nx || y >= P.ny || z >= P.nz)
+    return;
+
+  int x0 = P.nx - ((nprobe > 1) ? nprobe : 1);
+  if (x < x0)
+    return;
+
+  int i = idx3(x, y, z);
+  Prim q = log_to_prim(xi[i], phix[i], phiy[i], phiz[i], lam[i], zet[i]);
+  float p_ref = fmaxf(P.inflow_p, RHO_P_FLOOR);
+  atomicMaxFloat(g_max_dp, fabsf(q.p - p_ref));
+}
+
 static inline float clamp01(float x) {
   return x < 0.f ? 0.f : (x > 1.f ? 1.f : x);
 }
@@ -1230,6 +1327,7 @@ int main() {
   float *d_xi2, *d_phix2, *d_phiy2, *d_phiz2, *d_lam2, *d_zet2;
   float *d_vis;
   float *d_maxs;
+  float *d_reflect;
   uint8_t *d_solid;
   int vis_mode = VIS_SCHLIEREN_RHO;
 
@@ -1249,6 +1347,7 @@ int main() {
 
   ck(cudaMalloc(&d_vis, bytes), "malloc vis");
   ck(cudaMalloc(&d_maxs, sizeof(float)), "malloc maxs");
+  ck(cudaMalloc(&d_reflect, sizeof(float)), "malloc reflect");
   ck(cudaMalloc(&d_solid, N * sizeof(uint8_t)), "malloc solid mask");
 
   dim3 block(8, 8, 4);
@@ -1331,6 +1430,7 @@ int main() {
       zslice = (zslice + 1) % hp.nz;
 
     float maxs = 0.f;
+    float refl_dp = 0.f;
     float dt = 0.f;
 
     if (!paused) {
@@ -1374,6 +1474,17 @@ int main() {
        "copy vis");
     ck(cudaDeviceSynchronize(), "sch sync");
 
+    {
+      float zero = 0.f;
+      ck(cudaMemcpy(d_reflect, &zero, sizeof(float), cudaMemcpyHostToDevice),
+         "set reflect metric");
+      k_outflow_reflection_metric<<<grid, block>>>(
+          d_xi, d_phix, d_phiy, d_phiz, d_lam, d_zet, d_reflect, 6);
+      ck(cudaGetLastError(), "k_outflow_reflection_metric launch");
+      ck(cudaMemcpy(&refl_dp, d_reflect, sizeof(float), cudaMemcpyDeviceToHost),
+         "get reflect metric");
+    }
+
     for (int z = 0; z < hp.nz; z += z_stride) {
       slice_to_rgba(h_rgba.data(), h_sch.data(), hp.nx, hp.ny, hp.nz, z,
                     log_scale, a_gain);
@@ -1403,8 +1514,10 @@ int main() {
 
     DrawRectangle(10, 10, 760, 90, Fade(BLACK, 0.55f));
     DrawText(TextFormat(
-                 "t=%g  dt=%g  d_tau=%g  maxs=%g  a_gain=%g  stride=%d mode=%s",
-                 t, dt, d_tau, maxs, a_gain, z_stride, vis_name(vis_mode)),
+                 "t=%g  dt=%g  d_tau=%g  maxs=%g  outflow |dp|=%g  a_gain=%g  "
+                 "stride=%d mode=%s",
+                 t, dt, d_tau, maxs, refl_dp, a_gain, z_stride,
+                 vis_name(vis_mode)),
              18, 18, 18, RAYWHITE);
     DrawText("RMB orbit  |  MMB pan  |  wheel zoom  |  SPACE pause  |  L log  "
              "|  R reset  |  +/- opacity  |  1/2/3 stride",
@@ -1431,6 +1544,7 @@ int main() {
   ck(cudaFree(d_zet2), "free");
   ck(cudaFree(d_vis), "free");
   ck(cudaFree(d_maxs), "free");
+  ck(cudaFree(d_reflect), "free");
   ck(cudaFree(d_solid), "free");
 
   return 0;
