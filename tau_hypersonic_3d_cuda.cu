@@ -287,6 +287,48 @@ __device__ inline Cons flux_z(const Prim &q) {
   return F;
 }
 
+__device__ inline float axis_velocity(const Prim &q, int axis) {
+  if (axis == 0)
+    return q.u;
+  if (axis == 1)
+    return q.v;
+  return q.w;
+}
+
+__device__ inline float axis_crossflow_speed(const Prim &L, const Prim &R,
+                                              int axis) {
+  if (axis == 0)
+    return (fabsf(L.v) + fabsf(R.v) + fabsf(L.w) + fabsf(R.w)) * 0.5f;
+  if (axis == 1)
+    return (fabsf(L.u) + fabsf(R.u) + fabsf(L.w) + fabsf(R.w)) * 0.5f;
+  return (fabsf(L.u) + fabsf(R.u) + fabsf(L.v) + fabsf(R.v)) * 0.5f;
+}
+
+__device__ inline Cons axis_flux(const Prim &q, int axis) {
+  if (axis == 0)
+    return flux_x(q);
+  if (axis == 1)
+    return flux_y(q);
+  return flux_z(q);
+}
+
+__device__ inline void fill_star_momentum(Cons &UStar, const Prim &q,
+                                          float rStar, float sM, int axis) {
+  if (axis == 0) {
+    UStar.mx = rStar * sM;
+    UStar.my = rStar * q.v;
+    UStar.mz = rStar * q.w;
+  } else if (axis == 1) {
+    UStar.mx = rStar * q.u;
+    UStar.my = rStar * sM;
+    UStar.mz = rStar * q.w;
+  } else {
+    UStar.mx = rStar * q.u;
+    UStar.my = rStar * q.v;
+    UStar.mz = rStar * sM;
+  }
+}
+
 __device__ inline Cons addC(const Cons &a, const Cons &b) {
   return {a.r + b.r,   a.mx + b.mx, a.my + b.my,
           a.mz + b.mz, a.Et + b.Et, a.Ev + b.Ev};
@@ -318,10 +360,12 @@ __device__ inline float shock_sensor(const Prim &L, const Prim &R) {
   return clampf(5.f * s, 0.f, 1.f);
 }
 
-__device__ inline Cons hllc_flux_x(const Prim &L, const Prim &R) {
+__device__ inline Cons hllc_flux_axis(const Prim &L, const Prim &R, int axis) {
   float aL = soundspeed(L), aR = soundspeed(R);
-  float sL = fminf(L.u - aL, R.u - aR);
-  float sR = fmaxf(L.u + aL, R.u + aR);
+  float unL = axis_velocity(L, axis);
+  float unR = axis_velocity(R, axis);
+  float sL = fminf(unL - aL, unR - aR);
+  float sR = fmaxf(unL + aL, unR + aR);
 
   float aRef = fmaxf(aL, aR);
   sL = entropy_fix_speed(sL, aRef);
@@ -329,8 +373,8 @@ __device__ inline Cons hllc_flux_x(const Prim &L, const Prim &R) {
 
   Cons UL = prim_to_cons(L);
   Cons UR = prim_to_cons(R);
-  Cons FL = flux_x(L);
-  Cons FR = flux_x(R);
+  Cons FL = axis_flux(L, axis);
+  Cons FR = axis_flux(R, axis);
 
   if (sL >= 0.f)
     return FL;
@@ -338,18 +382,16 @@ __device__ inline Cons hllc_flux_x(const Prim &L, const Prim &R) {
     return FR;
 
   float rL = L.r, rR = R.r;
-  float uL = L.u, uR = R.u;
   float pL = L.p, pR = R.p;
 
-  float denom = fmaxf(rL * (sL - uL) - rR * (sR - uR), DENOM_EPS);
-  float sM = (pR - pL + rL * uL * (sL - uL) - rR * uR * (sR - uR)) / denom;
+  float denom = fmaxf(rL * (sL - unL) - rR * (sR - unR), DENOM_EPS);
+  float sM = (pR - pL + rL * unL * (sL - unL) - rR * unR * (sR - unR)) / denom;
 
-  float pStarL = pL + rL * (sL - uL) * (sM - uL);
-  float pStarR = pR + rR * (sR - uR) * (sM - uR);
+  float pStarL = pL + rL * (sL - unL) * (sM - unL);
+  float pStarR = pR + rR * (sR - unR) * (sM - unR);
   float pStar = 0.5f * (pStarL + pStarR);
 
-  // float sgn = (sM >= 0.f) ? 1.f : -1.f;
-  float vCarb = (fabsf(L.v) + fabsf(R.v) + fabsf(L.w) + fabsf(R.w)) * 0.5f;
+  float vCarb = axis_crossflow_speed(L, R, axis);
   float align = clampf(1.f - vCarb / fmaxf(aRef, DENOM_EPS), 0.f, 1.f);
   float alpha = shock_sensor(L, R) * align;
 
@@ -361,200 +403,52 @@ __device__ inline Cons hllc_flux_x(const Prim &L, const Prim &R) {
   }
 
   if (sM >= 0.f) {
-    float rStar = rL * (sL - uL) / fmaxf(sL - sM, DENOM_EPS);
+    float rStar = rL * (sL - unL) / fmaxf(sL - sM, DENOM_EPS);
 
     float EL = UL.Et;
     float EStar =
-        ((sL - uL) * EL - pL * uL + pStar * sM) / fmaxf(sL - sM, DENOM_EPS);
+        ((sL - unL) * EL - pL * unL + pStar * sM) / fmaxf(sL - sM, DENOM_EPS);
 
-    float EvStar = UL.Ev * (sL - uL) / fmaxf(sL - sM, DENOM_EPS);
+    float EvStar = UL.Ev * (sL - unL) / fmaxf(sL - sM, DENOM_EPS);
 
     Cons UStar;
     UStar.r = rStar;
-    UStar.mx = rStar * sM;
-    UStar.my = rStar * L.v;
-    UStar.mz = rStar * L.w;
+    fill_star_momentum(UStar, L, rStar, sM, axis);
     UStar.Et = EStar;
     UStar.Ev = EvStar;
 
     Cons FHLLC = addC(FL, mulC(subC(UStar, UL), sL));
     return addC(mulC(FHLLC, 1.f - alpha), mulC(FHLL, alpha));
   } else {
-    float rStar = rR * (sR - uR) / fmaxf(sR - sM, DENOM_EPS);
+    float rStar = rR * (sR - unR) / fmaxf(sR - sM, DENOM_EPS);
 
     float ER = UR.Et;
     float EStar =
-        ((sR - uR) * ER - pR * uR + pStar * sM) / fmaxf(sR - sM, DENOM_EPS);
+        ((sR - unR) * ER - pR * unR + pStar * sM) / fmaxf(sR - sM, DENOM_EPS);
 
-    float EvStar = UR.Ev * (sR - uR) / fmaxf(sR - sM, DENOM_EPS);
+    float EvStar = UR.Ev * (sR - unR) / fmaxf(sR - sM, DENOM_EPS);
 
     Cons UStar;
     UStar.r = rStar;
-    UStar.mx = rStar * sM;
-    UStar.my = rStar * R.v;
-    UStar.mz = rStar * R.w;
+    fill_star_momentum(UStar, R, rStar, sM, axis);
     UStar.Et = EStar;
     UStar.Ev = EvStar;
 
     Cons FHLLC = addC(FR, mulC(subC(UStar, UR), sR));
     return addC(mulC(FHLLC, 1.f - alpha), mulC(FHLL, alpha));
   }
+}
+
+__device__ inline Cons hllc_flux_x(const Prim &L, const Prim &R) {
+  return hllc_flux_axis(L, R, 0);
 }
 
 __device__ inline Cons hllc_flux_y(const Prim &L, const Prim &R) {
-  float aL = soundspeed(L), aR = soundspeed(R);
-  float sL = fminf(L.v - aL, R.v - aR);
-  float sR = fmaxf(L.v + aL, R.v + aR);
-
-  float aRef = fmaxf(aL, aR);
-  sL = entropy_fix_speed(sL, aRef);
-  sR = entropy_fix_speed(sR, aRef);
-
-  Cons UL = prim_to_cons(L);
-  Cons UR = prim_to_cons(R);
-  Cons FL = flux_y(L);
-  Cons FR = flux_y(R);
-
-  if (sL >= 0.f)
-    return FL;
-  if (sR <= 0.f)
-    return FR;
-
-  float rL = L.r, rR = R.r;
-  float uL = L.v, uR = R.v;
-  float pL = L.p, pR = R.p;
-
-  float denom = fmaxf(rL * (sL - uL) - rR * (sR - uR), DENOM_EPS);
-  float sM = (pR - pL + rL * uL * (sL - uL) - rR * uR * (sR - uR)) / denom;
-
-  float pStarL = pL + rL * (sL - uL) * (sM - uL);
-  float pStarR = pR + rR * (sR - uR) * (sM - uR);
-  float pStar = 0.5f * (pStarL + pStarR);
-
-  float vCarb = (fabsf(L.u) + fabsf(R.u) + fabsf(L.w) + fabsf(R.w)) * 0.5f;
-  float align = clampf(1.f - vCarb / fmaxf(aRef, DENOM_EPS), 0.f, 1.f);
-  float alpha = shock_sensor(L, R) * align;
-
-  Cons FHLL;
-  {
-    Cons num = subC(mulC(FL, sR), mulC(FR, sL));
-    Cons corr = mulC(subC(UR, UL), sL * sR);
-    FHLL = mulC(addC(num, corr), 1.f / fmaxf(sR - sL, DENOM_EPS));
-  }
-
-  if (sM >= 0.f) {
-    float rStar = rL * (sL - uL) / fmaxf(sL - sM, DENOM_EPS);
-    float EL = UL.Et;
-    float EStar =
-        ((sL - uL) * EL - pL * uL + pStar * sM) / fmaxf(sL - sM, DENOM_EPS);
-    float EvStar = UL.Ev * (sL - uL) / fmaxf(sL - sM, DENOM_EPS);
-
-    Cons UStar;
-    UStar.r = rStar;
-    UStar.mx = rStar * L.u;
-    UStar.my = rStar * sM;
-    UStar.mz = rStar * L.w;
-    UStar.Et = EStar;
-    UStar.Ev = EvStar;
-
-    Cons FHLLC = addC(FL, mulC(subC(UStar, UL), sL));
-    return addC(mulC(FHLLC, 1.f - alpha), mulC(FHLL, alpha));
-  } else {
-    float rStar = rR * (sR - uR) / fmaxf(sR - sM, DENOM_EPS);
-    float ER = UR.Et;
-    float EStar =
-        ((sR - uR) * ER - pR * uR + pStar * sM) / fmaxf(sR - sM, DENOM_EPS);
-    float EvStar = UR.Ev * (sR - uR) / fmaxf(sR - sM, DENOM_EPS);
-
-    Cons UStar;
-    UStar.r = rStar;
-    UStar.mx = rStar * R.u;
-    UStar.my = rStar * sM;
-    UStar.mz = rStar * R.w;
-    UStar.Et = EStar;
-    UStar.Ev = EvStar;
-
-    Cons FHLLC = addC(FR, mulC(subC(UStar, UR), sR));
-    return addC(mulC(FHLLC, 1.f - alpha), mulC(FHLL, alpha));
-  }
+  return hllc_flux_axis(L, R, 1);
 }
 
 __device__ inline Cons hllc_flux_z(const Prim &L, const Prim &R) {
-  float aL = soundspeed(L), aR = soundspeed(R);
-  float sL = fminf(L.w - aL, R.w - aR);
-  float sR = fmaxf(L.w + aL, R.w + aR);
-
-  float aRef = fmaxf(aL, aR);
-  sL = entropy_fix_speed(sL, aRef);
-  sR = entropy_fix_speed(sR, aRef);
-
-  Cons UL = prim_to_cons(L);
-  Cons UR = prim_to_cons(R);
-  Cons FL = flux_z(L);
-  Cons FR = flux_z(R);
-
-  if (sL >= 0.f)
-    return FL;
-  if (sR <= 0.f)
-    return FR;
-
-  float rL = L.r, rR = R.r;
-  float uL = L.w, uR = R.w;
-  float pL = L.p, pR = R.p;
-
-  float denom = fmaxf(rL * (sL - uL) - rR * (sR - uR), DENOM_EPS);
-  float sM = (pR - pL + rL * uL * (sL - uL) - rR * uR * (sR - uR)) / denom;
-
-  float pStarL = pL + rL * (sL - uL) * (sM - uL);
-  float pStarR = pR + rR * (sR - uR) * (sM - uR);
-  float pStar = 0.5f * (pStarL + pStarR);
-
-  float vCarb = (fabsf(L.u) + fabsf(R.u) + fabsf(L.v) + fabsf(R.v)) * 0.5f;
-  float align = clampf(1.f - vCarb / fmaxf(aRef, DENOM_EPS), 0.f, 1.f);
-  float alpha = shock_sensor(L, R) * align;
-
-  Cons FHLL;
-  {
-    Cons num = subC(mulC(FL, sR), mulC(FR, sL));
-    Cons corr = mulC(subC(UR, UL), sL * sR);
-    FHLL = mulC(addC(num, corr), 1.f / fmaxf(sR - sL, DENOM_EPS));
-  }
-
-  if (sM >= 0.f) {
-    float rStar = rL * (sL - uL) / fmaxf(sL - sM, DENOM_EPS);
-    float EL = UL.Et;
-    float EStar =
-        ((sL - uL) * EL - pL * uL + pStar * sM) / fmaxf(sL - sM, DENOM_EPS);
-    float EvStar = UL.Ev * (sL - uL) / fmaxf(sL - sM, DENOM_EPS);
-
-    Cons UStar;
-    UStar.r = rStar;
-    UStar.mx = rStar * L.u;
-    UStar.my = rStar * L.v;
-    UStar.mz = rStar * sM;
-    UStar.Et = EStar;
-    UStar.Ev = EvStar;
-
-    Cons FHLLC = addC(FL, mulC(subC(UStar, UL), sL));
-    return addC(mulC(FHLLC, 1.f - alpha), mulC(FHLL, alpha));
-  } else {
-    float rStar = rR * (sR - uR) / fmaxf(sR - sM, DENOM_EPS);
-    float ER = UR.Et;
-    float EStar =
-        ((sR - uR) * ER - pR * uR + pStar * sM) / fmaxf(sR - sM, DENOM_EPS);
-    float EvStar = UR.Ev * (sR - uR) / fmaxf(sR - sM, DENOM_EPS);
-
-    Cons UStar;
-    UStar.r = rStar;
-    UStar.mx = rStar * R.u;
-    UStar.my = rStar * R.v;
-    UStar.mz = rStar * sM;
-    UStar.Et = EStar;
-    UStar.Ev = EvStar;
-
-    Cons FHLLC = addC(FR, mulC(subC(UStar, UR), sR));
-    return addC(mulC(FHLLC, 1.f - alpha), mulC(FHLL, alpha));
-  }
+  return hllc_flux_axis(L, R, 2);
 }
 
 __device__ inline Prim limited_recon_x(Prim qm, Prim q0, Prim qp) {
