@@ -25,9 +25,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define W 1600
-#define H 512
-#define SCALE 1
+#define W 8192
+#define H 1024
+#define SCALE 0.25
 
 #define EPS_RHO 1e-25
 #define EPS_P 1e-25
@@ -139,7 +139,7 @@ __device__ __forceinline__ double d_isfinite(double x) {
   return isfinite(x) ? 1.0 : 0.0;
 }
 
-// prims and cons
+// primitaves and conserved
 __device__ __forceinline__ Prim cons_to_prim(Cons c) {
   Prim p;
   double rho = d_fmax(c.rho, EPS_RHO);
@@ -260,10 +260,6 @@ __device__ __forceinline__ void store_cons(Csoa A, int i, Cons c) {
 }
 
 __device__ __forceinline__ Prim wall_ghost_prim(Prim inside) {
-  // Wall model: reflective no-slip ghost state built from the adjacent fluid
-  // cell. We preserve thermodynamic state and flip velocity so the wall face
-  // velocity is zero at the interface (instead of imposing a fixed stagnation
-  // state unrelated to local interior conditions).
   return Prim{inside.rho, -inside.u, -inside.v, inside.p};
 }
 
@@ -724,8 +720,6 @@ __device__ __forceinline__ Prim sample_prim_bc(const Usoa U,
 
   int i = d_idx(x, y);
   if (mask[i]) {
-    // Keep render-side boundary sampling consistent with solver ghost states,
-    // especially for gradient-based views (schlieren and vorticity).
     Prim interior = cons_to_prim(load_cons(U, d_idx(xc, yc)));
     return wall_ghost_prim(interior);
   }
@@ -1405,7 +1399,7 @@ static SimConfig default_config() {
   cfg.visc_rho = 5e-2;
   cfg.visc_e = 2e-2;
   cfg.inflow_mach = 25.0;
-  cfg.geom_x0 = (double)W / 12.0;
+  cfg.geom_x0 = 125.0;
   cfg.geom_cy = (double)H / 2.0;
   cfg.geom_Rb = (double)H / 12.0;
   cfg.geom_Rn = (double)H / 24.0;
@@ -1442,8 +1436,8 @@ static TileCliConfig tile_preset_for_device(const cudaDeviceProp &prop) {
     cfg.tile_by = 8;
   }
 
-  const int max_threads = prop.maxThreadsPerBlock > 0 ? prop.maxThreadsPerBlock
-                                                       : 1024;
+  const int max_threads =
+      prop.maxThreadsPerBlock > 0 ? prop.maxThreadsPerBlock : 1024;
   while (cfg.tile_bx * cfg.tile_by > max_threads && cfg.tile_by > 1) {
     cfg.tile_by /= 2;
   }
@@ -1636,9 +1630,8 @@ static bool parse_args(int argc, char **argv, SimConfig *cfg,
 
   if ((tile_cfg->tile_bx_set && tile_cfg->tile_bx <= 0) ||
       (tile_cfg->tile_by_set && tile_cfg->tile_by <= 0)) {
-    fprintf(stderr,
-            "Invalid tile dimensions: --tile-bx and --tile-by must be "
-            "positive when provided.\n");
+    fprintf(stderr, "Invalid tile dimensions: --tile-bx and --tile-by must be "
+                    "positive when provided.\n");
     return false;
   }
 
@@ -1711,8 +1704,8 @@ static void print_config(const SimConfig &cfg, const TileLaunchConfig &tile_cfg,
   printf("  tile_block=(%u,%u) grid=(%u,%u) source=%s\n", tile_cfg.block.x,
          tile_cfg.block.y, tile_cfg.grid.x, tile_cfg.grid.y,
          tile_cfg.preset_name);
-  printf("  dynamic_shared_bytes: predict=%zu step=%zu\n",
-         tile_cfg.shm_predict, tile_cfg.shm_step);
+  printf("  dynamic_shared_bytes: predict=%zu step=%zu\n", tile_cfg.shm_predict,
+         tile_cfg.shm_step);
 }
 
 #ifndef TAU_HYPERSONIC_CUDA_NO_MAIN
