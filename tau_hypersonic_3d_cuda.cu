@@ -990,12 +990,13 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
 
   Cons Fx_m, Fx_p;
   {
-    Prim qxm3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, xm3, y, z);
-    Prim qxm2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, xm2, y, z);
-    Prim qxm1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, xm1, y, z);
-    Prim qxp0 = q0;
-    Prim qxp1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, xp1, y, z);
-    Prim qxp2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, xp2, y, z);
+    Prim qx_m3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, xm3, y, z);
+    Prim qx_m2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, xm2, y, z);
+    Prim qx_m1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, xm1, y, z);
+    Prim qx_0 = q0;
+    Prim qx_p1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, xp1, y, z);
+    Prim qx_p2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, xp2, y, z);
+    Prim qx_p3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, xp3, y, z);
 
     float X0 = (x + 0.5f) * P.dx;
     float Xm1 = (xm1 + 0.5f) * P.dx;
@@ -1008,15 +1009,9 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
       Fx_m = {0, 0, 0, 0, 0, 0};
     else {
       Prim L, R;
-      weno_face_from_6(qxm3, qxm2, qxm1, qxp0, qxp1, qxp2, L, R);
+      weno_face_from_6(qx_m3, qx_m2, qx_m1, qx_0, qx_p1, qx_p2, L, R);
       Fx_m = hllc_flux_x(L, R);
     }
-
-    Prim qxm2b = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, xm2, y, z);
-    Prim qxm1b = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, xm1, y, z);
-    Prim qxp1b = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, xp1, y, z);
-    Prim qxp2b = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, xp2, y, z);
-    Prim qxp3b = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, xp3, y, z);
 
     float Xp1 = (xp1 + 0.5f) * P.dx;
     bool solid_p =
@@ -1025,19 +1020,20 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
       Fx_p = {0, 0, 0, 0, 0, 0};
     else {
       Prim L, R;
-      weno_face_from_6(qxm2b, qxm1b, q0, qxp1b, qxp2b, qxp3b, L, R);
+      weno_face_from_6(qx_m2, qx_m1, qx_0, qx_p1, qx_p2, qx_p3, L, R);
       Fx_p = hllc_flux_x(L, R);
     }
   }
 
   Cons Fy_m, Fy_p;
   {
-    Prim qym3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, ym3, z);
-    Prim qym2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, ym2, z);
-    Prim qym1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, ym1, z);
-    Prim qyp0 = q0;
-    Prim qyp1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, yp1, z);
-    Prim qyp2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, yp2, z);
+    Prim qy_m3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, ym3, z);
+    Prim qy_m2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, ym2, z);
+    Prim qy_m1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, ym1, z);
+    Prim qy_0 = q0;
+    Prim qy_p1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, yp1, z);
+    Prim qy_p2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, yp2, z);
+    Prim qy_p3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, yp3, z);
 
     float X0 = (x + 0.5f) * P.dx;
     float Y0 = (y + 0.5f) * P.dy;
@@ -1050,15 +1046,9 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
       Fy_m = {0, 0, 0, 0, 0, 0};
     else {
       Prim L, R;
-      weno_face_from_6(qym3, qym2, qym1, qyp0, qyp1, qyp2, L, R);
+      weno_face_from_6(qy_m3, qy_m2, qy_m1, qy_0, qy_p1, qy_p2, L, R);
       Fy_m = hllc_flux_y(L, R);
     }
-
-    Prim qym2b = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, ym2, z);
-    Prim qym1b = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, ym1, z);
-    Prim qyp1b = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, yp1, z);
-    Prim qyp2b = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, yp2, z);
-    Prim qyp3b = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, yp3, z);
 
     float Yp1 = (yp1 + 0.5f) * P.dy;
     bool solid_p =
@@ -1067,19 +1057,20 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
       Fy_p = {0, 0, 0, 0, 0, 0};
     else {
       Prim L, R;
-      weno_face_from_6(qym2b, qym1b, q0, qyp1b, qyp2b, qyp3b, L, R);
+      weno_face_from_6(qy_m2, qy_m1, qy_0, qy_p1, qy_p2, qy_p3, L, R);
       Fy_p = hllc_flux_y(L, R);
     }
   }
 
   Cons Fz_m, Fz_p;
   {
-    Prim qzm3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, zm3);
-    Prim qzm2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, zm2);
-    Prim qzm1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, zm1);
-    Prim qzp0 = q0;
-    Prim qzp1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, zp1);
-    Prim qzp2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, zp2);
+    Prim qz_m3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, zm3);
+    Prim qz_m2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, zm2);
+    Prim qz_m1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, zm1);
+    Prim qz_0 = q0;
+    Prim qz_p1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, zp1);
+    Prim qz_p2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, zp2);
+    Prim qz_p3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, zp3);
 
     float X0 = (x + 0.5f) * P.dx;
     float Y0 = (y + 0.5f) * P.dy;
@@ -1092,15 +1083,9 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
       Fz_m = {0, 0, 0, 0, 0, 0};
     else {
       Prim L, R;
-      weno_face_from_6(qzm3, qzm2, qzm1, qzp0, qzp1, qzp2, L, R);
+      weno_face_from_6(qz_m3, qz_m2, qz_m1, qz_0, qz_p1, qz_p2, L, R);
       Fz_m = hllc_flux_z(L, R);
     }
-
-    Prim qzm2b = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, zm2);
-    Prim qzm1b = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, zm1);
-    Prim qzp1b = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, zp1);
-    Prim qzp2b = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, zp2);
-    Prim qzp3b = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, zp3);
 
     float Zp1 = (zp1 + 0.5f) * P.dz;
     bool solid_p =
@@ -1109,7 +1094,7 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
       Fz_p = {0, 0, 0, 0, 0, 0};
     else {
       Prim L, R;
-      weno_face_from_6(qzm2b, qzm1b, q0, qzp1b, qzp2b, qzp3b, L, R);
+      weno_face_from_6(qz_m2, qz_m1, qz_0, qz_p1, qz_p2, qz_p3, L, R);
       Fz_p = hllc_flux_z(L, R);
     }
   }
