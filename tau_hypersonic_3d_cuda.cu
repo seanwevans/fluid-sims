@@ -59,6 +59,7 @@ constexpr float DENOM_EPS = 1e-12f;
 constexpr float NEWTON_TEMP_FLOOR = 1e-6f;
 // Minimum vibrational relaxation time to cap source-term stiffness.
 constexpr float TAU_VIB_MIN = 1e-9f;
+constexpr int WENO_HALO = 3;
 
 // helpers
 
@@ -668,6 +669,12 @@ __device__ inline Prim prim_at_xbc(const float *xi, const float *phix,
   return q;
 }
 
+__device__ inline bool solid_at_xbc(const uint8_t *solid, int x, int y, int z) {
+  y = wrapi(y, P.ny);
+  z = wrapi(z, P.nz);
+  return cell_is_solid(solid, x, y, z);
+}
+
 __global__ void k_build_solid_mask(uint8_t *solid) {
   int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
   int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
@@ -874,36 +881,105 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
   int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
   int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
   int z = (int)(blockIdx.z * blockDim.z + threadIdx.z);
-  if (x >= P.nx || y >= P.ny || z >= P.nz)
+  bool in_domain = (x < P.nx && y < P.ny && z < P.nz);
+
+  const int sx = (int)blockDim.x + 2 * WENO_HALO;
+  const int sy = (int)blockDim.y + 2 * WENO_HALO;
+  const int sz = (int)blockDim.z + 2 * WENO_HALO;
+  const int sxy = sx * sy;
+  const int svol = sxy * sz;
+
+  extern __shared__ unsigned char s_mem[];
+  float *s_r = reinterpret_cast<float *>(s_mem);
+  float *s_u = s_r + svol;
+  float *s_v = s_u + svol;
+  float *s_w = s_v + svol;
+  float *s_p = s_w + svol;
+  float *s_ev = s_p + svol;
+  uint8_t *s_solid = reinterpret_cast<uint8_t *>(s_ev + svol);
+
+  int tid = (int)((threadIdx.z * blockDim.y + threadIdx.y) * blockDim.x +
+                  threadIdx.x);
+  int tcount = (int)(blockDim.x * blockDim.y * blockDim.z);
+  int bx0 = (int)(blockIdx.x * blockDim.x);
+  int by0 = (int)(blockIdx.y * blockDim.y);
+  int bz0 = (int)(blockIdx.z * blockDim.z);
+
+  for (int t = tid; t < svol; t += tcount) {
+    int lz = t / sxy;
+    int rem = t - lz * sxy;
+    int ly = rem / sx;
+    int lx = rem - ly * sx;
+
+    int gx = bx0 + lx - WENO_HALO;
+    int gy = by0 + ly - WENO_HALO;
+    int gz = bz0 + lz - WENO_HALO;
+
+    int gyw = wrapi(gy, P.ny);
+    int gzw = wrapi(gz, P.nz);
+
+    bool is_solid = solid_at_xbc(solid, gx, gyw, gzw);
+    Prim q;
+    if (gx < 0) {
+      q = inflow_prim();
+    } else {
+      int gxc = (gx >= P.nx) ? (P.nx - 1) : gx;
+      int gi = idx3(gxc, gyw, gzw);
+      q = log_to_prim(xi[gi], phix[gi], phiy[gi], phiz[gi], lam[gi], zet[gi]);
+    }
+    if (is_solid)
+      apply_wall(q);
+
+    s_r[t] = q.r;
+    s_u[t] = q.u;
+    s_v[t] = q.v;
+    s_w[t] = q.w;
+    s_p[t] = q.p;
+    s_ev[t] = q.ev;
+    s_solid[t] = is_solid ? 1 : 0;
+  }
+  __syncthreads();
+
+  if (!in_domain)
     return;
 
   int i = idx3(x, y, z);
+  int lcx = (int)threadIdx.x + WENO_HALO;
+  int lcy = (int)threadIdx.y + WENO_HALO;
+  int lcz = (int)threadIdx.z + WENO_HALO;
 
-  int xm1 = x - 1, xp1 = x + 1;
-  int xm2 = x - 2, xp2 = x + 2;
-  int xm3 = x - 3, xp3 = x + 3;
+  auto prim_sh = [&](int ox, int oy, int oz) {
+    int j = ((lcz + oz) * sy + (lcy + oy)) * sx + (lcx + ox);
+    Prim q;
+    q.r = s_r[j];
+    q.u = s_u[j];
+    q.v = s_v[j];
+    q.w = s_w[j];
+    q.p = s_p[j];
+    q.ev = s_ev[j];
+    q.T = 0.f;
+    q.Tv = 0.f;
+    return q;
+  };
 
-  int ym1 = wrapi(y - 1, P.ny), yp1 = wrapi(y + 1, P.ny);
-  int ym2 = wrapi(y - 2, P.ny), yp2 = wrapi(y + 2, P.ny);
-  int ym3 = wrapi(y - 3, P.ny), yp3 = wrapi(y + 3, P.ny);
+  auto solid_sh = [&](int ox, int oy, int oz) {
+    int j = ((lcz + oz) * sy + (lcy + oy)) * sx + (lcx + ox);
+    return s_solid[j] != 0;
+  };
 
-  int zm1 = wrapi(z - 1, P.nz), zp1 = wrapi(z + 1, P.nz);
-  int zm2 = wrapi(z - 2, P.nz), zp2 = wrapi(z + 2, P.nz);
-  int zm3 = wrapi(z - 3, P.nz), zp3 = wrapi(z + 3, P.nz);
-
-  Prim q0 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, y, z);
+  Prim q0 = prim_sh(0, 0, 0);
 
   Cons Fx_m, Fx_p;
   {
-    Prim qx_m3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, xm3, y, z);
-    Prim qx_m2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, xm2, y, z);
-    Prim qx_m1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, xm1, y, z);
+    Prim qx_m3 = prim_sh(-3, 0, 0);
+    Prim qx_m2 = prim_sh(-2, 0, 0);
+    Prim qx_m1 = prim_sh(-1, 0, 0);
     Prim qx_0 = q0;
-    Prim qx_p1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, xp1, y, z);
-    Prim qx_p2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, xp2, y, z);
-    Prim qx_p3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, xp3, y, z);
+    Prim qx_p1 = prim_sh(1, 0, 0);
+    Prim qx_p2 = prim_sh(2, 0, 0);
+    Prim qx_p3 = prim_sh(3, 0, 0);
 
-    bool solid_m = cell_is_solid(solid, xm1, y, z) || cell_is_solid(solid, x, y, z);
+    bool solid_m = solid_sh(-1, 0, 0) || solid_sh(0, 0, 0);
     if (solid_m)
       Fx_m = {0, 0, 0, 0, 0, 0};
     else {
@@ -912,7 +988,7 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
       Fx_m = hllc_flux_x(L, R);
     }
 
-    bool solid_p = cell_is_solid(solid, x, y, z) || cell_is_solid(solid, xp1, y, z);
+    bool solid_p = solid_sh(0, 0, 0) || solid_sh(1, 0, 0);
     if (solid_p)
       Fx_p = {0, 0, 0, 0, 0, 0};
     else {
@@ -924,15 +1000,15 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
 
   Cons Fy_m, Fy_p;
   {
-    Prim qy_m3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, ym3, z);
-    Prim qy_m2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, ym2, z);
-    Prim qy_m1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, ym1, z);
+    Prim qy_m3 = prim_sh(0, -3, 0);
+    Prim qy_m2 = prim_sh(0, -2, 0);
+    Prim qy_m1 = prim_sh(0, -1, 0);
     Prim qy_0 = q0;
-    Prim qy_p1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, yp1, z);
-    Prim qy_p2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, yp2, z);
-    Prim qy_p3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, yp3, z);
+    Prim qy_p1 = prim_sh(0, 1, 0);
+    Prim qy_p2 = prim_sh(0, 2, 0);
+    Prim qy_p3 = prim_sh(0, 3, 0);
 
-    bool solid_m = cell_is_solid(solid, x, ym1, z) || cell_is_solid(solid, x, y, z);
+    bool solid_m = solid_sh(0, -1, 0) || solid_sh(0, 0, 0);
     if (solid_m)
       Fy_m = {0, 0, 0, 0, 0, 0};
     else {
@@ -941,7 +1017,7 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
       Fy_m = hllc_flux_y(L, R);
     }
 
-    bool solid_p = cell_is_solid(solid, x, y, z) || cell_is_solid(solid, x, yp1, z);
+    bool solid_p = solid_sh(0, 0, 0) || solid_sh(0, 1, 0);
     if (solid_p)
       Fy_p = {0, 0, 0, 0, 0, 0};
     else {
@@ -953,15 +1029,15 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
 
   Cons Fz_m, Fz_p;
   {
-    Prim qz_m3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, y, zm3);
-    Prim qz_m2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, y, zm2);
-    Prim qz_m1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, y, zm1);
+    Prim qz_m3 = prim_sh(0, 0, -3);
+    Prim qz_m2 = prim_sh(0, 0, -2);
+    Prim qz_m1 = prim_sh(0, 0, -1);
     Prim qz_0 = q0;
-    Prim qz_p1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, y, zp1);
-    Prim qz_p2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, y, zp2);
-    Prim qz_p3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, y, zp3);
+    Prim qz_p1 = prim_sh(0, 0, 1);
+    Prim qz_p2 = prim_sh(0, 0, 2);
+    Prim qz_p3 = prim_sh(0, 0, 3);
 
-    bool solid_m = cell_is_solid(solid, x, y, zm1) || cell_is_solid(solid, x, y, z);
+    bool solid_m = solid_sh(0, 0, -1) || solid_sh(0, 0, 0);
     if (solid_m)
       Fz_m = {0, 0, 0, 0, 0, 0};
     else {
@@ -970,7 +1046,7 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
       Fz_m = hllc_flux_z(L, R);
     }
 
-    bool solid_p = cell_is_solid(solid, x, y, z) || cell_is_solid(solid, x, y, zp1);
+    bool solid_p = solid_sh(0, 0, 0) || solid_sh(0, 0, 1);
     if (solid_p)
       Fz_p = {0, 0, 0, 0, 0, 0};
     else {
@@ -1254,6 +1330,13 @@ int main() {
   dim3 block(8, 8, 4);
   dim3 grid((hp.nx + block.x - 1) / block.x, (hp.ny + block.y - 1) / block.y,
             (hp.nz + block.z - 1) / block.z);
+  size_t k_step_smem =
+      (size_t)(block.x + 2 * WENO_HALO) * (size_t)(block.y + 2 * WENO_HALO) *
+      (size_t)(block.z + 2 * WENO_HALO) *
+      (6 * sizeof(float) + sizeof(uint8_t));
+  ck(cudaFuncSetAttribute(k_step, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                          (int)k_step_smem),
+     "k_step shared-memory attribute");
 
   k_build_solid_mask<<<grid, block>>>(d_solid);
   ck(cudaGetLastError(), "k_build_solid_mask launch");
@@ -1342,9 +1425,10 @@ int main() {
         ck(cudaMemcpy(d_maxs, &zero, sizeof(float), cudaMemcpyHostToDevice),
            "set maxs");
 
-        k_step<<<grid, block>>>(d_xi, d_phix, d_phiy, d_phiz, d_lam, d_zet,
-                                d_xi2, d_phix2, d_phiy2, d_phiz2, d_lam2,
-                                d_zet2, dt, inflow_gain, d_maxs, d_solid);
+        k_step<<<grid, block, k_step_smem>>>(d_xi, d_phix, d_phiy, d_phiz,
+                                              d_lam, d_zet, d_xi2, d_phix2,
+                                              d_phiy2, d_phiz2, d_lam2, d_zet2,
+                                              dt, inflow_gain, d_maxs, d_solid);
         ck(cudaGetLastError(), "k_step launch");
 
         ck(cudaMemcpy(&maxs, d_maxs, sizeof(float), cudaMemcpyDeviceToHost),
