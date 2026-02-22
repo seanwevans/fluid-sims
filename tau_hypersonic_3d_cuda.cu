@@ -175,6 +175,17 @@ __device__ inline float sdf_sphere(float x, float y, float z) {
   return sqrtf(dx * dx + dy * dy + dz * dz) - P.sdf_r;
 }
 
+__device__ inline bool cell_is_solid(const uint8_t *solid, int x, int y, int z) {
+  if (x >= 0 && x < P.nx && y >= 0 && y < P.ny && z >= 0 && z < P.nz)
+    return solid[idx3(x, y, z)] != 0;
+
+  // Ghost lookups only happen near x boundaries; keep this fallback rare.
+  float X = (x + 0.5f) * P.dx;
+  float Y = (y + 0.5f) * P.dy;
+  float Z = (z + 0.5f) * P.dz;
+  return sdf_sphere(X, Y, Z) < 0.f;
+}
+
 __device__ inline float Tv_from_evib_seed(float evib, float Tseed) {
   float Tv = fmaxf(P.Twall, fmaxf(Tseed, NEWTON_TEMP_FLOOR));
 #pragma unroll
@@ -608,14 +619,11 @@ __device__ inline void weno_face_from_6(const Prim &q0, const Prim &q1,
 
 __device__ inline Prim prim_at(const float *xi, const float *phix,
                                const float *phiy, const float *phiz,
-                               const float *lam, const float *zet, int x, int y,
-                               int z) {
+                               const float *lam, const float *zet,
+                               const uint8_t *solid, int x, int y, int z) {
   int i = idx3(x, y, z);
   Prim q = log_to_prim(xi[i], phix[i], phiy[i], phiz[i], lam[i], zet[i]);
-  float X = (x + 0.5f) * P.dx;
-  float Y = (y + 0.5f) * P.dy;
-  float Z = (z + 0.5f) * P.dz;
-  if (sdf_sphere(X, Y, Z) < 0.f)
+  if (cell_is_solid(solid, x, y, z))
     apply_wall(q);
   return q;
 }
@@ -635,8 +643,8 @@ __device__ inline Prim inflow_prim() {
 
 __device__ inline Prim prim_at_xbc(const float *xi, const float *phix,
                                    const float *phiy, const float *phiz,
-                                   const float *lam, const float *zet, int x,
-                                   int y, int z) {
+                                   const float *lam, const float *zet,
+                                   const uint8_t *solid, int x, int y, int z) {
   // y,z periodic
   y = wrapi(y, P.ny);
   z = wrapi(z, P.nz);
@@ -644,10 +652,7 @@ __device__ inline Prim prim_at_xbc(const float *xi, const float *phix,
   if (x < 0) {
     Prim q = inflow_prim();
     // still enforce internal solid if you want it to block inflow stencils
-    float X = (x + 0.5f) * P.dx;
-    float Y = (y + 0.5f) * P.dy;
-    float Z = (z + 0.5f) * P.dz;
-    if (sdf_sphere(X, Y, Z) < 0.f)
+    if (cell_is_solid(solid, x, y, z))
       apply_wall(q);
     return q;
   }
@@ -658,12 +663,22 @@ __device__ inline Prim prim_at_xbc(const float *xi, const float *phix,
   int i = idx3(x, y, z);
   Prim q = log_to_prim(xi[i], phix[i], phiy[i], phiz[i], lam[i], zet[i]);
 
+  if (cell_is_solid(solid, x, y, z))
+    apply_wall(q);
+  return q;
+}
+
+__global__ void k_build_solid_mask(uint8_t *solid) {
+  int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+  int z = (int)(blockIdx.z * blockDim.z + threadIdx.z);
+  if (x >= P.nx || y >= P.ny || z >= P.nz)
+    return;
+
   float X = (x + 0.5f) * P.dx;
   float Y = (y + 0.5f) * P.dy;
   float Z = (z + 0.5f) * P.dz;
-  if (sdf_sphere(X, Y, Z) < 0.f)
-    apply_wall(q);
-  return q;
+  solid[idx3(x, y, z)] = (sdf_sphere(X, Y, Z) < 0.f) ? 1 : 0;
 }
 
 // global kernels
@@ -685,7 +700,7 @@ __device__ inline float safe_log1pf_dev(float x) {
 
 __global__ void k_vis(const float *xi, const float *phix, const float *phiy,
                       const float *phiz, const float *lam, const float *zet,
-                      float *out, int mode) {
+                      const uint8_t *solid, float *out, int mode) {
   int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
   int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
   int z = (int)(blockIdx.z * blockDim.z + threadIdx.z);
@@ -694,12 +709,8 @@ __global__ void k_vis(const float *xi, const float *phix, const float *phiy,
 
   int i = idx3(x, y, z);
 
-  float X0 = (x + 0.5f) * P.dx;
-  float Y0 = (y + 0.5f) * P.dy;
-  float Z0 = (z + 0.5f) * P.dz;
-
   // mask solid interior so it doesn't dominate visuals
-  if (sdf_sphere(X0, Y0, Z0) < 0.f) {
+  if (solid[i]) {
     out[i] = 0.f;
     return;
   }
@@ -710,7 +721,7 @@ __global__ void k_vis(const float *xi, const float *phix, const float *phiy,
   int zm = wrapi(z - 1, P.nz), zp = wrapi(z + 1, P.nz);
 
   // For anything needing primitives, use BC-aware accessor
-  Prim q0 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, z);
+  Prim q0 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, y, z);
 
   if (mode == VIS_LOG_RHO) {
     out[i] = safe_log1pf_dev(q0.r);
@@ -733,12 +744,12 @@ __global__ void k_vis(const float *xi, const float *phix, const float *phiy,
   }
 
   // Need neighbors for derivatives (curl/div/Q/schlieren)
-  Prim qxm = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, xm, y, z);
-  Prim qxp = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, xp, y, z);
-  Prim qym = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, ym, z);
-  Prim qyp = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, yp, z);
-  Prim qzm = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, zm);
-  Prim qzp = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, zp);
+  Prim qxm = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, xm, y, z);
+  Prim qxp = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, xp, y, z);
+  Prim qym = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, ym, z);
+  Prim qyp = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, yp, z);
+  Prim qzm = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, y, zm);
+  Prim qzp = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, y, zp);
 
   float inv2dx = 0.5f / P.dx;
   float inv2dy = 0.5f / P.dy;
@@ -802,7 +813,7 @@ __global__ void k_vis(const float *xi, const float *phix, const float *phiy,
 }
 
 __global__ void k_init(float *xi, float *phix, float *phiy, float *phiz,
-                       float *lam, float *zet) {
+                       float *lam, float *zet, const uint8_t *solid) {
   int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
   int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
   int z = (int)(blockIdx.z * blockDim.z + threadIdx.z);
@@ -834,7 +845,7 @@ __global__ void k_init(float *xi, float *phix, float *phiy, float *phiz,
   float X = (x + 0.5f) * P.dx;
   float Y = (y + 0.5f) * P.dy;
   float Z = (z + 0.5f) * P.dz;
-  if (sdf_sphere(X, Y, Z) < 0.f) {
+  if (solid[i]) {
     // Keep pressure matched to ambient to prevent an artificial blast
     // by choosing wall density consistent with (p = rho R Twall).
     q.u = 0.f;
@@ -859,7 +870,7 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
                        const float *phiz, const float *lam, const float *zet,
                        float *xi2, float *phix2, float *phiy2, float *phiz2,
                        float *lam2, float *zet2, float dt, float inflow_gain,
-                       float *g_maxwavespeed) {
+                       float *g_maxwavespeed, const uint8_t *solid) {
   int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
   int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
   int z = (int)(blockIdx.z * blockDim.z + threadIdx.z);
@@ -880,25 +891,19 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
   int zm2 = wrapi(z - 2, P.nz), zp2 = wrapi(z + 2, P.nz);
   int zm3 = wrapi(z - 3, P.nz), zp3 = wrapi(z + 3, P.nz);
 
-  Prim q0 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, z);
+  Prim q0 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, y, z);
 
   Cons Fx_m, Fx_p;
   {
-    Prim qx_m3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, xm3, y, z);
-    Prim qx_m2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, xm2, y, z);
-    Prim qx_m1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, xm1, y, z);
+    Prim qx_m3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, xm3, y, z);
+    Prim qx_m2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, xm2, y, z);
+    Prim qx_m1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, xm1, y, z);
     Prim qx_0 = q0;
-    Prim qx_p1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, xp1, y, z);
-    Prim qx_p2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, xp2, y, z);
-    Prim qx_p3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, xp3, y, z);
+    Prim qx_p1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, xp1, y, z);
+    Prim qx_p2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, xp2, y, z);
+    Prim qx_p3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, xp3, y, z);
 
-    float X0 = (x + 0.5f) * P.dx;
-    float Xm1 = (xm1 + 0.5f) * P.dx;
-    float Y0 = (y + 0.5f) * P.dy;
-    float Z0 = (z + 0.5f) * P.dz;
-
-    bool solid_m =
-        (sdf_sphere(Xm1, Y0, Z0) < 0.f) || (sdf_sphere(X0, Y0, Z0) < 0.f);
+    bool solid_m = cell_is_solid(solid, xm1, y, z) || cell_is_solid(solid, x, y, z);
     if (solid_m)
       Fx_m = {0, 0, 0, 0, 0, 0};
     else {
@@ -907,9 +912,7 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
       Fx_m = hllc_flux_x(L, R);
     }
 
-    float Xp1 = (xp1 + 0.5f) * P.dx;
-    bool solid_p =
-        (sdf_sphere(X0, Y0, Z0) < 0.f) || (sdf_sphere(Xp1, Y0, Z0) < 0.f);
+    bool solid_p = cell_is_solid(solid, x, y, z) || cell_is_solid(solid, xp1, y, z);
     if (solid_p)
       Fx_p = {0, 0, 0, 0, 0, 0};
     else {
@@ -921,21 +924,15 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
 
   Cons Fy_m, Fy_p;
   {
-    Prim qy_m3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, ym3, z);
-    Prim qy_m2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, ym2, z);
-    Prim qy_m1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, ym1, z);
+    Prim qy_m3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, ym3, z);
+    Prim qy_m2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, ym2, z);
+    Prim qy_m1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, ym1, z);
     Prim qy_0 = q0;
-    Prim qy_p1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, yp1, z);
-    Prim qy_p2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, yp2, z);
-    Prim qy_p3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, yp3, z);
+    Prim qy_p1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, yp1, z);
+    Prim qy_p2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, yp2, z);
+    Prim qy_p3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, yp3, z);
 
-    float X0 = (x + 0.5f) * P.dx;
-    float Y0 = (y + 0.5f) * P.dy;
-    float Ym1 = (ym1 + 0.5f) * P.dy;
-    float Z0 = (z + 0.5f) * P.dz;
-
-    bool solid_m =
-        (sdf_sphere(X0, Ym1, Z0) < 0.f) || (sdf_sphere(X0, Y0, Z0) < 0.f);
+    bool solid_m = cell_is_solid(solid, x, ym1, z) || cell_is_solid(solid, x, y, z);
     if (solid_m)
       Fy_m = {0, 0, 0, 0, 0, 0};
     else {
@@ -944,9 +941,7 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
       Fy_m = hllc_flux_y(L, R);
     }
 
-    float Yp1 = (yp1 + 0.5f) * P.dy;
-    bool solid_p =
-        (sdf_sphere(X0, Y0, Z0) < 0.f) || (sdf_sphere(X0, Yp1, Z0) < 0.f);
+    bool solid_p = cell_is_solid(solid, x, y, z) || cell_is_solid(solid, x, yp1, z);
     if (solid_p)
       Fy_p = {0, 0, 0, 0, 0, 0};
     else {
@@ -958,21 +953,15 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
 
   Cons Fz_m, Fz_p;
   {
-    Prim qz_m3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, zm3);
-    Prim qz_m2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, zm2);
-    Prim qz_m1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, zm1);
+    Prim qz_m3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, y, zm3);
+    Prim qz_m2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, y, zm2);
+    Prim qz_m1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, y, zm1);
     Prim qz_0 = q0;
-    Prim qz_p1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, zp1);
-    Prim qz_p2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, zp2);
-    Prim qz_p3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, x, y, zp3);
+    Prim qz_p1 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, y, zp1);
+    Prim qz_p2 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, y, zp2);
+    Prim qz_p3 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, y, zp3);
 
-    float X0 = (x + 0.5f) * P.dx;
-    float Y0 = (y + 0.5f) * P.dy;
-    float Z0 = (z + 0.5f) * P.dz;
-    float Zm1 = (zm1 + 0.5f) * P.dz;
-
-    bool solid_m =
-        (sdf_sphere(X0, Y0, Zm1) < 0.f) || (sdf_sphere(X0, Y0, Z0) < 0.f);
+    bool solid_m = cell_is_solid(solid, x, y, zm1) || cell_is_solid(solid, x, y, z);
     if (solid_m)
       Fz_m = {0, 0, 0, 0, 0, 0};
     else {
@@ -981,9 +970,7 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
       Fz_m = hllc_flux_z(L, R);
     }
 
-    float Zp1 = (zp1 + 0.5f) * P.dz;
-    bool solid_p =
-        (sdf_sphere(X0, Y0, Z0) < 0.f) || (sdf_sphere(X0, Y0, Zp1) < 0.f);
+    bool solid_p = cell_is_solid(solid, x, y, z) || cell_is_solid(solid, x, y, zp1);
     if (solid_p)
       Fz_p = {0, 0, 0, 0, 0, 0};
     else {
@@ -1178,8 +1165,8 @@ static void camera_orbit_pan_zoom(Camera3D *cam) {
 
 static void reset_sim(dim3 grid, dim3 block, float *d_xi, float *d_phix,
                       float *d_phiy, float *d_phiz, float *d_lam,
-                      float *d_zet) {
-  k_init<<<grid, block>>>(d_xi, d_phix, d_phiy, d_phiz, d_lam, d_zet);
+                      float *d_zet, const uint8_t *d_solid) {
+  k_init<<<grid, block>>>(d_xi, d_phix, d_phiy, d_phiz, d_lam, d_zet, d_solid);
   ck(cudaGetLastError(), "k_init launch");
   ck(cudaDeviceSynchronize(), "k_init sync");
 }
@@ -1243,6 +1230,7 @@ int main() {
   float *d_xi2, *d_phix2, *d_phiy2, *d_phiz2, *d_lam2, *d_zet2;
   float *d_vis;
   float *d_maxs;
+  uint8_t *d_solid;
   int vis_mode = VIS_SCHLIEREN_RHO;
 
   ck(cudaMalloc(&d_xi, bytes), "malloc xi");
@@ -1261,12 +1249,17 @@ int main() {
 
   ck(cudaMalloc(&d_vis, bytes), "malloc vis");
   ck(cudaMalloc(&d_maxs, sizeof(float)), "malloc maxs");
+  ck(cudaMalloc(&d_solid, N * sizeof(uint8_t)), "malloc solid mask");
 
   dim3 block(8, 8, 4);
   dim3 grid((hp.nx + block.x - 1) / block.x, (hp.ny + block.y - 1) / block.y,
             (hp.nz + block.z - 1) / block.z);
 
-  reset_sim(grid, block, d_xi, d_phix, d_phiy, d_phiz, d_lam, d_zet);
+  k_build_solid_mask<<<grid, block>>>(d_solid);
+  ck(cudaGetLastError(), "k_build_solid_mask launch");
+  ck(cudaDeviceSynchronize(), "k_build_solid_mask sync");
+
+  reset_sim(grid, block, d_xi, d_phix, d_phiy, d_phiz, d_lam, d_zet, d_solid);
 
   std::vector<float> h_sch(N);
   std::vector<uint32_t> h_rgba((size_t)hp.nx * (size_t)hp.ny);
@@ -1318,7 +1311,8 @@ int main() {
     if (IsKeyPressed(KEY_R)) {
       t = 1e-5f;
       d_tau = 1e-3f;
-      reset_sim(grid, block, d_xi, d_phix, d_phiy, d_phiz, d_lam, d_zet);
+      reset_sim(grid, block, d_xi, d_phix, d_phiy, d_phiz, d_lam, d_zet,
+                d_solid);
     }
     if (IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT))
       a_gain = fmaxf(0.05f, a_gain * 0.85f);
@@ -1350,7 +1344,7 @@ int main() {
 
         k_step<<<grid, block>>>(d_xi, d_phix, d_phiy, d_phiz, d_lam, d_zet,
                                 d_xi2, d_phix2, d_phiy2, d_phiz2, d_lam2,
-                                d_zet2, dt, inflow_gain, d_maxs);
+                                d_zet2, dt, inflow_gain, d_maxs, d_solid);
         ck(cudaGetLastError(), "k_step launch");
 
         ck(cudaMemcpy(&maxs, d_maxs, sizeof(float), cudaMemcpyDeviceToHost),
@@ -1371,8 +1365,8 @@ int main() {
       }
     }
 
-    k_vis<<<grid, block>>>(d_xi, d_phix, d_phiy, d_phiz, d_lam, d_zet, d_vis,
-                           vis_mode);
+    k_vis<<<grid, block>>>(d_xi, d_phix, d_phiy, d_phiz, d_lam, d_zet,
+                           d_solid, d_vis, vis_mode);
     ck(cudaGetLastError(), "k_vis launch");
     ck(cudaDeviceSynchronize(), "vis sync");
 
@@ -1437,6 +1431,7 @@ int main() {
   ck(cudaFree(d_zet2), "free");
   ck(cudaFree(d_vis), "free");
   ck(cudaFree(d_maxs), "free");
+  ck(cudaFree(d_solid), "free");
 
   return 0;
 }
