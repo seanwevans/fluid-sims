@@ -1295,9 +1295,7 @@ int main() {
   int zslice = hp.nz / 2;
   bool paused = false;
   bool log_scale = true;
-  float ramp = t / 0.02f;
   float a_gain = 0.55f; // opacity
-  float inflow_gain = fminf(fmaxf(ramp, 0.f), 1.f);
   int z_stride = 1; // 1=all slices, 2=half, 3=third
   const int steps_per_frame = 2;
 
@@ -1337,6 +1335,8 @@ int main() {
       for (int s = 0; s < steps_per_frame; s++) {
         t *= expf(d_tau);
         dt = t * d_tau;
+        float ramp = t / 0.02f;
+        float inflow_gain = fminf(fmaxf(ramp, 0.f), 1.f);
 
         float zero = 0.f;
         ck(cudaMemcpy(d_maxs, &zero, sizeof(float), cudaMemcpyHostToDevice),
