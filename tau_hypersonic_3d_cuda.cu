@@ -1187,12 +1187,14 @@ __global__ void k_schlieren(const float *xi, float *out) {
   if (x >= P.nx || y >= P.ny || z >= P.nz)
     return;
 
-  int xm = wrapi(x - 1, P.nx), xp = wrapi(x + 1, P.nx);
+  int xm = x - 1, xp = x + 1;
   int ym = wrapi(y - 1, P.ny), yp = wrapi(y + 1, P.ny);
   int zm = wrapi(z - 1, P.nz), zp = wrapi(z + 1, P.nz);
 
-  float rxm = rho_from_xi(xi[idx3(xm, y, z)]);
-  float rxp = rho_from_xi(xi[idx3(xp, y, z)]);
+  float rxm = (xm < 0) ? fmaxf(P.inflow_r, 1e-30f)
+                       : rho_from_xi(xi[idx3(xm, y, z)]);
+  float rxp = (xp >= P.nx) ? rho_from_xi(xi[idx3(P.nx - 1, y, z)])
+                           : rho_from_xi(xi[idx3(xp, y, z)]);
   float rym = rho_from_xi(xi[idx3(x, ym, z)]);
   float ryp = rho_from_xi(xi[idx3(x, yp, z)]);
   float rzm = rho_from_xi(xi[idx3(x, y, zm)]);
