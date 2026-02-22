@@ -47,6 +47,19 @@ struct Prim {
   float r, u, v, w, p, T, ev, Tv;
 };
 
+// Numerical/physical safety floors used by primitive/conservative conversion
+// and flux assembly. Keep these centralized so stability tuning stays explicit.
+// Smallest admissible density/pressure to preserve positive thermodynamic state.
+constexpr float RHO_P_FLOOR = 1e-30f;
+// Smallest admissible translational thermal energy when recovering pressure.
+constexpr float THERMAL_ENERGY_FLOOR = 1e-12f;
+// Generic denominator guard for wave-speed formulas and normalization.
+constexpr float DENOM_EPS = 1e-12f;
+// Newton-iteration temperature floor for vibrational temperature inversion.
+constexpr float NEWTON_TEMP_FLOOR = 1e-6f;
+// Minimum vibrational relaxation time to cap source-term stiffness.
+constexpr float TAU_VIB_MIN = 1e-9f;
+
 // helpers
 
 static inline void ck(cudaError_t e, const char *m) {
@@ -144,15 +157,15 @@ __device__ inline int wrapi(int i, int n) {
 }
 
 __device__ inline float xi_from_rho(float r) {
-  return __logf(fmaxf(r, 1e-30f));
+  return __logf(fmaxf(r, RHO_P_FLOOR));
 }
 
 __device__ inline float lambda_from_p(float p) {
-  return __logf(fmaxf(p, 1e-30f));
+  return __logf(fmaxf(p, RHO_P_FLOOR));
 }
 
 __device__ inline float zeta_from_evib(float e) {
-  return __logf(fmaxf(e, 1e-30f));
+  return __logf(fmaxf(e, RHO_P_FLOOR));
 }
 
 __device__ inline float sdf_sphere(float x, float y, float z) {
@@ -163,24 +176,24 @@ __device__ inline float sdf_sphere(float x, float y, float z) {
 }
 
 __device__ inline float Tv_from_evib_seed(float evib, float Tseed) {
-  float Tv = fmaxf(P.Twall, fmaxf(Tseed, 1e-6f));
+  float Tv = fmaxf(P.Twall, fmaxf(Tseed, NEWTON_TEMP_FLOOR));
 #pragma unroll
   for (int k = 0; k < 3; k++) {
-    float a = P.theta_v / fmaxf(Tv, 1e-6f);
+    float a = P.theta_v / fmaxf(Tv, NEWTON_TEMP_FLOOR);
     float ea = __expf(a);
-    float denom = fmaxf(ea - 1.f, 1e-6f);
+    float denom = fmaxf(ea - 1.f, NEWTON_TEMP_FLOOR);
     float f = (P.R * P.theta_v) / denom - evib;
     float df =
         (P.R * P.theta_v) * (ea * (P.theta_v / (Tv * Tv))) / (denom * denom);
-    Tv = fmaxf(1e-6f, Tv - f / fmaxf(df, 1e-12f));
+    Tv = fmaxf(NEWTON_TEMP_FLOOR, Tv - f / fmaxf(df, DENOM_EPS));
   }
   return Tv;
 }
 
 __device__ inline float evib_eq(float T) {
-  float a = P.theta_v / fmaxf(T, 1e-6f);
+  float a = P.theta_v / fmaxf(T, NEWTON_TEMP_FLOOR);
   float ea = __expf(a);
-  float denom = fmaxf(ea - 1.f, 1e-6f);
+  float denom = fmaxf(ea - 1.f, NEWTON_TEMP_FLOOR);
   return (P.R * P.theta_v) / denom;
 }
 
@@ -205,7 +218,7 @@ __device__ inline Cons prim_to_cons(const Prim &q) {
   U.my = q.r * q.v;
   U.mz = q.r * q.w;
   float ke = 0.5f * (q.u * q.u + q.v * q.v + q.w * q.w);
-  float e_th = q.p / fmaxf((P.gamma_floor - 1.f) * q.r, 1e-30f);
+  float e_th = q.p / fmaxf((P.gamma_floor - 1.f) * q.r, RHO_P_FLOOR);
   U.Ev = q.r * q.ev;
   U.Et = q.r * (ke + e_th + q.ev);
   return U;
@@ -213,15 +226,15 @@ __device__ inline Cons prim_to_cons(const Prim &q) {
 
 __device__ inline Prim cons_to_prim(const Cons &U) {
   Prim q;
-  q.r = fmaxf(U.r, 1e-30f);
+  q.r = fmaxf(U.r, RHO_P_FLOOR);
   q.u = U.mx / q.r;
   q.v = U.my / q.r;
   q.w = U.mz / q.r;
   float ke = 0.5f * (q.u * q.u + q.v * q.v + q.w * q.w);
   float ev = fmaxf(U.Ev / q.r, 0.f);
   float e_tot = U.Et / q.r;
-  float e_th = fmaxf(e_tot - ke - ev, 1e-12f);
-  q.p = fmaxf((P.gamma_floor - 1.f) * q.r * e_th, 1e-30f);
+  float e_th = fmaxf(e_tot - ke - ev, THERMAL_ENERGY_FLOOR);
+  q.p = fmaxf((P.gamma_floor - 1.f) * q.r * e_th, RHO_P_FLOOR);
   q.ev = ev;
   q.T = q.p / (q.r * P.R);
   q.Tv = Tv_from_evib_seed(q.ev, q.T);
@@ -229,14 +242,14 @@ __device__ inline Prim cons_to_prim(const Cons &U) {
 }
 
 __device__ inline float soundspeed(const Prim &q) {
-  return sqrtf(fmaxf(P.gamma_floor * q.p / q.r, 1e-12f));
+  return sqrtf(fmaxf(P.gamma_floor * q.p / q.r, DENOM_EPS));
 }
 
 __device__ inline Cons flux_x(const Prim &q) {
   Cons F;
   float u = q.u;
   float H = (q.p / q.r) + (0.5f * (q.u * q.u + q.v * q.v + q.w * q.w) + q.ev) +
-            q.p / fmaxf((P.gamma_floor - 1.f) * q.r, 1e-30f);
+            q.p / fmaxf((P.gamma_floor - 1.f) * q.r, RHO_P_FLOOR);
   F.r = q.r * u;
   F.mx = q.r * q.u * u + q.p;
   F.my = q.r * q.v * u;
@@ -250,7 +263,7 @@ __device__ inline Cons flux_y(const Prim &q) {
   Cons F;
   float v = q.v;
   float H = (q.p / q.r) + (0.5f * (q.u * q.u + q.v * q.v + q.w * q.w) + q.ev) +
-            q.p / fmaxf((P.gamma_floor - 1.f) * q.r, 1e-30f);
+            q.p / fmaxf((P.gamma_floor - 1.f) * q.r, RHO_P_FLOOR);
   F.r = q.r * v;
   F.mx = q.r * q.u * v;
   F.my = q.r * q.v * v + q.p;
@@ -264,7 +277,7 @@ __device__ inline Cons flux_z(const Prim &q) {
   Cons F;
   float w = q.w;
   float H = (q.p / q.r) + (0.5f * (q.u * q.u + q.v * q.v + q.w * q.w) + q.ev) +
-            q.p / fmaxf((P.gamma_floor - 1.f) * q.r, 1e-30f);
+            q.p / fmaxf((P.gamma_floor - 1.f) * q.r, RHO_P_FLOOR);
   F.r = q.r * w;
   F.mx = q.r * q.u * w;
   F.my = q.r * q.v * w;
@@ -294,13 +307,13 @@ __device__ inline float entropy_fix_speed(float s, float a_ref) {
   if (as >= d)
     return s;
   float sgn = (s >= 0.f) ? 1.f : -1.f;
-  float sm = 0.5f * (as * as / fmaxf(d, 1e-12f) + d);
+  float sm = 0.5f * (as * as / fmaxf(d, DENOM_EPS) + d);
   return sgn * sm;
 }
 
 __device__ inline float shock_sensor(const Prim &L, const Prim &R) {
-  float dp = fabsf(R.p - L.p) / fmaxf(R.p + L.p, 1e-12f);
-  float dr = fabsf(R.r - L.r) / fmaxf(R.r + L.r, 1e-12f);
+  float dp = fabsf(R.p - L.p) / fmaxf(R.p + L.p, DENOM_EPS);
+  float dr = fabsf(R.r - L.r) / fmaxf(R.r + L.r, DENOM_EPS);
   float s = 0.5f * (dp + dr);
   return clampf(5.f * s, 0.f, 1.f);
 }
@@ -328,7 +341,7 @@ __device__ inline Cons hllc_flux_x(const Prim &L, const Prim &R) {
   float uL = L.u, uR = R.u;
   float pL = L.p, pR = R.p;
 
-  float denom = fmaxf(rL * (sL - uL) - rR * (sR - uR), 1e-12f);
+  float denom = fmaxf(rL * (sL - uL) - rR * (sR - uR), DENOM_EPS);
   float sM = (pR - pL + rL * uL * (sL - uL) - rR * uR * (sR - uR)) / denom;
 
   float pStarL = pL + rL * (sL - uL) * (sM - uL);
@@ -337,24 +350,24 @@ __device__ inline Cons hllc_flux_x(const Prim &L, const Prim &R) {
 
   // float sgn = (sM >= 0.f) ? 1.f : -1.f;
   float vCarb = (fabsf(L.v) + fabsf(R.v) + fabsf(L.w) + fabsf(R.w)) * 0.5f;
-  float align = clampf(1.f - vCarb / fmaxf(aRef, 1e-12f), 0.f, 1.f);
+  float align = clampf(1.f - vCarb / fmaxf(aRef, DENOM_EPS), 0.f, 1.f);
   float alpha = shock_sensor(L, R) * align;
 
   Cons FHLL;
   {
     Cons num = subC(mulC(FL, sR), mulC(FR, sL));
     Cons corr = mulC(subC(UR, UL), sL * sR);
-    FHLL = mulC(addC(num, corr), 1.f / fmaxf(sR - sL, 1e-12f));
+    FHLL = mulC(addC(num, corr), 1.f / fmaxf(sR - sL, DENOM_EPS));
   }
 
   if (sM >= 0.f) {
-    float rStar = rL * (sL - uL) / fmaxf(sL - sM, 1e-12f);
+    float rStar = rL * (sL - uL) / fmaxf(sL - sM, DENOM_EPS);
 
     float EL = UL.Et;
     float EStar =
-        ((sL - uL) * EL - pL * uL + pStar * sM) / fmaxf(sL - sM, 1e-12f);
+        ((sL - uL) * EL - pL * uL + pStar * sM) / fmaxf(sL - sM, DENOM_EPS);
 
-    float EvStar = UL.Ev * (sL - uL) / fmaxf(sL - sM, 1e-12f);
+    float EvStar = UL.Ev * (sL - uL) / fmaxf(sL - sM, DENOM_EPS);
 
     Cons UStar;
     UStar.r = rStar;
@@ -367,13 +380,13 @@ __device__ inline Cons hllc_flux_x(const Prim &L, const Prim &R) {
     Cons FHLLC = addC(FL, mulC(subC(UStar, UL), sL));
     return addC(mulC(FHLLC, 1.f - alpha), mulC(FHLL, alpha));
   } else {
-    float rStar = rR * (sR - uR) / fmaxf(sR - sM, 1e-12f);
+    float rStar = rR * (sR - uR) / fmaxf(sR - sM, DENOM_EPS);
 
     float ER = UR.Et;
     float EStar =
-        ((sR - uR) * ER - pR * uR + pStar * sM) / fmaxf(sR - sM, 1e-12f);
+        ((sR - uR) * ER - pR * uR + pStar * sM) / fmaxf(sR - sM, DENOM_EPS);
 
-    float EvStar = UR.Ev * (sR - uR) / fmaxf(sR - sM, 1e-12f);
+    float EvStar = UR.Ev * (sR - uR) / fmaxf(sR - sM, DENOM_EPS);
 
     Cons UStar;
     UStar.r = rStar;
@@ -411,7 +424,7 @@ __device__ inline Cons hllc_flux_y(const Prim &L, const Prim &R) {
   float uL = L.v, uR = R.v;
   float pL = L.p, pR = R.p;
 
-  float denom = fmaxf(rL * (sL - uL) - rR * (sR - uR), 1e-12f);
+  float denom = fmaxf(rL * (sL - uL) - rR * (sR - uR), DENOM_EPS);
   float sM = (pR - pL + rL * uL * (sL - uL) - rR * uR * (sR - uR)) / denom;
 
   float pStarL = pL + rL * (sL - uL) * (sM - uL);
@@ -419,22 +432,22 @@ __device__ inline Cons hllc_flux_y(const Prim &L, const Prim &R) {
   float pStar = 0.5f * (pStarL + pStarR);
 
   float vCarb = (fabsf(L.u) + fabsf(R.u) + fabsf(L.w) + fabsf(R.w)) * 0.5f;
-  float align = clampf(1.f - vCarb / fmaxf(aRef, 1e-12f), 0.f, 1.f);
+  float align = clampf(1.f - vCarb / fmaxf(aRef, DENOM_EPS), 0.f, 1.f);
   float alpha = shock_sensor(L, R) * align;
 
   Cons FHLL;
   {
     Cons num = subC(mulC(FL, sR), mulC(FR, sL));
     Cons corr = mulC(subC(UR, UL), sL * sR);
-    FHLL = mulC(addC(num, corr), 1.f / fmaxf(sR - sL, 1e-12f));
+    FHLL = mulC(addC(num, corr), 1.f / fmaxf(sR - sL, DENOM_EPS));
   }
 
   if (sM >= 0.f) {
-    float rStar = rL * (sL - uL) / fmaxf(sL - sM, 1e-12f);
+    float rStar = rL * (sL - uL) / fmaxf(sL - sM, DENOM_EPS);
     float EL = UL.Et;
     float EStar =
-        ((sL - uL) * EL - pL * uL + pStar * sM) / fmaxf(sL - sM, 1e-12f);
-    float EvStar = UL.Ev * (sL - uL) / fmaxf(sL - sM, 1e-12f);
+        ((sL - uL) * EL - pL * uL + pStar * sM) / fmaxf(sL - sM, DENOM_EPS);
+    float EvStar = UL.Ev * (sL - uL) / fmaxf(sL - sM, DENOM_EPS);
 
     Cons UStar;
     UStar.r = rStar;
@@ -447,11 +460,11 @@ __device__ inline Cons hllc_flux_y(const Prim &L, const Prim &R) {
     Cons FHLLC = addC(FL, mulC(subC(UStar, UL), sL));
     return addC(mulC(FHLLC, 1.f - alpha), mulC(FHLL, alpha));
   } else {
-    float rStar = rR * (sR - uR) / fmaxf(sR - sM, 1e-12f);
+    float rStar = rR * (sR - uR) / fmaxf(sR - sM, DENOM_EPS);
     float ER = UR.Et;
     float EStar =
-        ((sR - uR) * ER - pR * uR + pStar * sM) / fmaxf(sR - sM, 1e-12f);
-    float EvStar = UR.Ev * (sR - uR) / fmaxf(sR - sM, 1e-12f);
+        ((sR - uR) * ER - pR * uR + pStar * sM) / fmaxf(sR - sM, DENOM_EPS);
+    float EvStar = UR.Ev * (sR - uR) / fmaxf(sR - sM, DENOM_EPS);
 
     Cons UStar;
     UStar.r = rStar;
@@ -489,7 +502,7 @@ __device__ inline Cons hllc_flux_z(const Prim &L, const Prim &R) {
   float uL = L.w, uR = R.w;
   float pL = L.p, pR = R.p;
 
-  float denom = fmaxf(rL * (sL - uL) - rR * (sR - uR), 1e-12f);
+  float denom = fmaxf(rL * (sL - uL) - rR * (sR - uR), DENOM_EPS);
   float sM = (pR - pL + rL * uL * (sL - uL) - rR * uR * (sR - uR)) / denom;
 
   float pStarL = pL + rL * (sL - uL) * (sM - uL);
@@ -497,22 +510,22 @@ __device__ inline Cons hllc_flux_z(const Prim &L, const Prim &R) {
   float pStar = 0.5f * (pStarL + pStarR);
 
   float vCarb = (fabsf(L.u) + fabsf(R.u) + fabsf(L.v) + fabsf(R.v)) * 0.5f;
-  float align = clampf(1.f - vCarb / fmaxf(aRef, 1e-12f), 0.f, 1.f);
+  float align = clampf(1.f - vCarb / fmaxf(aRef, DENOM_EPS), 0.f, 1.f);
   float alpha = shock_sensor(L, R) * align;
 
   Cons FHLL;
   {
     Cons num = subC(mulC(FL, sR), mulC(FR, sL));
     Cons corr = mulC(subC(UR, UL), sL * sR);
-    FHLL = mulC(addC(num, corr), 1.f / fmaxf(sR - sL, 1e-12f));
+    FHLL = mulC(addC(num, corr), 1.f / fmaxf(sR - sL, DENOM_EPS));
   }
 
   if (sM >= 0.f) {
-    float rStar = rL * (sL - uL) / fmaxf(sL - sM, 1e-12f);
+    float rStar = rL * (sL - uL) / fmaxf(sL - sM, DENOM_EPS);
     float EL = UL.Et;
     float EStar =
-        ((sL - uL) * EL - pL * uL + pStar * sM) / fmaxf(sL - sM, 1e-12f);
-    float EvStar = UL.Ev * (sL - uL) / fmaxf(sL - sM, 1e-12f);
+        ((sL - uL) * EL - pL * uL + pStar * sM) / fmaxf(sL - sM, DENOM_EPS);
+    float EvStar = UL.Ev * (sL - uL) / fmaxf(sL - sM, DENOM_EPS);
 
     Cons UStar;
     UStar.r = rStar;
@@ -525,11 +538,11 @@ __device__ inline Cons hllc_flux_z(const Prim &L, const Prim &R) {
     Cons FHLLC = addC(FL, mulC(subC(UStar, UL), sL));
     return addC(mulC(FHLLC, 1.f - alpha), mulC(FHLL, alpha));
   } else {
-    float rStar = rR * (sR - uR) / fmaxf(sR - sM, 1e-12f);
+    float rStar = rR * (sR - uR) / fmaxf(sR - sM, DENOM_EPS);
     float ER = UR.Et;
     float EStar =
-        ((sR - uR) * ER - pR * uR + pStar * sM) / fmaxf(sR - sM, 1e-12f);
-    float EvStar = UR.Ev * (sR - uR) / fmaxf(sR - sM, 1e-12f);
+        ((sR - uR) * ER - pR * uR + pStar * sM) / fmaxf(sR - sM, DENOM_EPS);
+    float EvStar = UR.Ev * (sR - uR) / fmaxf(sR - sM, DENOM_EPS);
 
     Cons UStar;
     UStar.r = rStar;
@@ -565,10 +578,10 @@ __device__ inline Prim limited_recon_x(Prim qm, Prim q0, Prim qp) {
   qR.p = q0.p + 0.5f * dp;
   qL.ev = q0.ev - 0.5f * dev;
   qR.ev = q0.ev + 0.5f * dev;
-  qL.r = fmaxf(qL.r, 1e-30f);
-  qR.r = fmaxf(qR.r, 1e-30f);
-  qL.p = fmaxf(qL.p, 1e-30f);
-  qR.p = fmaxf(qR.p, 1e-30f);
+  qL.r = fmaxf(qL.r, RHO_P_FLOOR);
+  qR.r = fmaxf(qR.r, RHO_P_FLOOR);
+  qL.p = fmaxf(qL.p, RHO_P_FLOOR);
+  qR.p = fmaxf(qR.p, RHO_P_FLOOR);
   qL.ev = fmaxf(qL.ev, 0.f);
   qR.ev = fmaxf(qR.ev, 0.f);
   qL.T = qL.p / (qL.r * P.R);
@@ -602,10 +615,10 @@ __device__ inline void recon_pair_x(const Prim &qm, const Prim &q0,
   L.ev = q0.ev - 0.5f * dev;
   R.ev = q0.ev + 0.5f * dev;
 
-  L.r = fmaxf(L.r, 1e-30f);
-  R.r = fmaxf(R.r, 1e-30f);
-  L.p = fmaxf(L.p, 1e-30f);
-  R.p = fmaxf(R.p, 1e-30f);
+  L.r = fmaxf(L.r, RHO_P_FLOOR);
+  R.r = fmaxf(R.r, RHO_P_FLOOR);
+  L.p = fmaxf(L.p, RHO_P_FLOOR);
+  R.p = fmaxf(R.p, RHO_P_FLOOR);
   L.ev = fmaxf(L.ev, 0.f);
   R.ev = fmaxf(R.ev, 0.f);
 
@@ -620,7 +633,7 @@ __device__ inline void apply_wall(Prim &q) {
   q.v = 0.f;
   q.w = 0.f;
   q.T = P.Twall;
-  q.p = fmaxf(q.r * P.R * q.T, 1e-30f);
+  q.p = fmaxf(q.r * P.R * q.T, RHO_P_FLOOR);
   q.ev = evib_eq(P.Twall);
   q.Tv = P.Twall;
 }
@@ -649,7 +662,7 @@ __device__ inline float weno5_left(float v0, float v1, float v2, float v3,
   float b2 = (13.f / 12.f) * (v2 - 2.f * v3 + v4) * (v2 - 2.f * v3 + v4) +
              0.25f * (3.f * v2 - 4.f * v3 + v4) * (3.f * v2 - 4.f * v3 + v4);
 
-  float eps = 1e-6f;
+  float eps = NEWTON_TEMP_FLOOR;
   float a0 = 0.1f / ((eps + b0) * (eps + b0));
   float a1 = 0.6f / ((eps + b1) * (eps + b1));
   float a2 = 0.3f / ((eps + b2) * (eps + b2));
@@ -668,8 +681,8 @@ __device__ inline float weno5_right(float v0, float v1, float v2, float v3,
 }
 
 __device__ inline void prim_floor(Prim &q) {
-  q.r = fmaxf(q.r, 1e-30f);
-  q.p = fmaxf(q.p, 1e-30f);
+  q.r = fmaxf(q.r, RHO_P_FLOOR);
+  q.p = fmaxf(q.p, RHO_P_FLOOR);
   q.ev = fmaxf(q.ev, 0.f);
   q.T = q.p / (q.r * P.R);
   q.Tv = Tv_from_evib_seed(q.ev, q.T);
@@ -715,11 +728,11 @@ __device__ inline Prim prim_at(const float *xi, const float *phix,
 
 __device__ inline Prim inflow_prim() {
   Prim q{};
-  q.r = fmaxf(P.inflow_r, 1e-30f);
+  q.r = fmaxf(P.inflow_r, RHO_P_FLOOR);
   q.u = P.inflow_u;
   q.v = P.inflow_v;
   q.w = P.inflow_w;
-  q.p = fmaxf(P.inflow_p, 1e-30f);
+  q.p = fmaxf(P.inflow_p, RHO_P_FLOOR);
   q.T = q.p / (q.r * P.R);
   q.ev = evib_eq(q.T);
   q.Tv = Tv_from_evib_seed(q.ev, q.T);
@@ -821,7 +834,7 @@ __global__ void k_vis(const float *xi, const float *phix, const float *phiy,
   if (mode == VIS_MACH) {
     float a = soundspeed(q0);
     float s = sqrtf(q0.u * q0.u + q0.v * q0.v + q0.w * q0.w);
-    out[i] = s / fmaxf(a, 1e-12f);
+    out[i] = s / fmaxf(a, DENOM_EPS);
     return;
   }
 
@@ -905,8 +918,8 @@ __global__ void k_init(float *xi, float *phix, float *phiy, float *phiz,
   int i = idx3(x, y, z);
 
   // Ambient thermodynamic state = inflow (no initial pressure mismatch)
-  float r = fmaxf(P.inflow_r, 1e-30f);
-  float p = fmaxf(P.inflow_p, 1e-30f);
+  float r = fmaxf(P.inflow_r, RHO_P_FLOOR);
+  float p = fmaxf(P.inflow_p, RHO_P_FLOOR);
 
   // Start at rest everywhere to avoid an impulsive "sphere appears in a moving
   // flow"
@@ -935,7 +948,7 @@ __global__ void k_init(float *xi, float *phix, float *phiy, float *phiz,
     q.w = 0.f;
     q.T = P.Twall;
     q.p = p;
-    q.r = fmaxf(q.p / (P.R * fmaxf(q.T, 1e-12f)), 1e-30f);
+    q.r = fmaxf(q.p / (P.R * fmaxf(q.T, DENOM_EPS)), RHO_P_FLOOR);
     q.ev = evib_eq(q.T);
     q.Tv = q.T;
   }
@@ -1121,7 +1134,7 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
   Prim q1 = cons_to_prim(U1);
 
   float ev_eq = evib_eq(q1.T);
-  q1.ev = fmaxf(q1.ev + (ev_eq - q1.ev) * (dt / fmaxf(P.tau_vib, 1e-9f)), 0.f);
+  q1.ev = fmaxf(q1.ev + (ev_eq - q1.ev) * (dt / fmaxf(P.tau_vib, TAU_VIB_MIN)), 0.f);
   q1.Tv = Tv_from_evib_seed(q1.ev, q1.T);
 
   // Sponge near inflow boundary (x small): gently relax toward ramped inflow
@@ -1133,8 +1146,8 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
     float k = P.sponge_strength * (s * s); // stronger right at boundary
 
     Prim tgt{};
-    tgt.r = fmaxf(P.inflow_r, 1e-30f);
-    tgt.p = fmaxf(P.inflow_p, 1e-30f);
+    tgt.r = fmaxf(P.inflow_r, RHO_P_FLOOR);
+    tgt.p = fmaxf(P.inflow_p, RHO_P_FLOOR);
     tgt.u = inflow_gain * P.inflow_u;
     tgt.v = inflow_gain * P.inflow_v;
     tgt.w = inflow_gain * P.inflow_w;
@@ -1143,8 +1156,8 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
     tgt.Tv = Tv_from_evib_seed(tgt.ev, tgt.T);
 
     // blend primitives (simple, effective for a sponge)
-    q1.r = fmaxf(q1.r + k * (tgt.r - q1.r), 1e-30f);
-    q1.p = fmaxf(q1.p + k * (tgt.p - q1.p), 1e-30f);
+    q1.r = fmaxf(q1.r + k * (tgt.r - q1.r), RHO_P_FLOOR);
+    q1.p = fmaxf(q1.p + k * (tgt.p - q1.p), RHO_P_FLOOR);
     q1.u = q1.u + k * (tgt.u - q1.u);
     q1.v = q1.v + k * (tgt.v - q1.v);
     q1.w = q1.w + k * (tgt.w - q1.w);
