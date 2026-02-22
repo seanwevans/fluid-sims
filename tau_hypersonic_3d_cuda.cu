@@ -222,8 +222,8 @@ __device__ inline float evib_eq(float T) {
   return (P.R * P.theta_v) / denom;
 }
 
-__device__ inline Prim log_to_prim(float xi, float phix, float phiy, float phiz,
-                                   float lam, float zet) {
+__device__ inline Prim log_to_prim_fast(float xi, float phix, float phiy,
+                                        float phiz, float lam, float zet) {
   Prim q;
   q.r = rho_from_xi(xi);
   q.u = vel_from_phi(phix);
@@ -232,6 +232,13 @@ __device__ inline Prim log_to_prim(float xi, float phix, float phiy, float phiz,
   q.p = p_from_lambda(lam);
   q.ev = evib_from_zeta(zet);
   q.T = q.p / (q.r * P.R);
+  q.Tv = 0.f;
+  return q;
+}
+
+__device__ inline Prim log_to_prim_full(float xi, float phix, float phiy,
+                                        float phiz, float lam, float zet) {
+  Prim q = log_to_prim_fast(xi, phix, phiy, phiz, lam, zet);
   q.Tv = Tv_from_evib_seed(q.ev, q.T);
   return q;
 }
@@ -568,11 +575,16 @@ __device__ inline float weno5_right(float v0, float v1, float v2, float v3,
   return weno5_left(v4, v3, v2, v1, v0);
 }
 
-__device__ inline void prim_floor(Prim &q) {
+__device__ inline void prim_floor_fast(Prim &q) {
   q.r = fmaxf(q.r, RHO_P_FLOOR);
   q.p = fmaxf(q.p, RHO_P_FLOOR);
   q.ev = fmaxf(q.ev, 0.f);
   q.T = q.p / (q.r * P.R);
+  q.Tv = 0.f;
+}
+
+__device__ inline void prim_floor_full(Prim &q) {
+  prim_floor_fast(q);
   q.Tv = Tv_from_evib_seed(q.ev, q.T);
 }
 
@@ -596,8 +608,8 @@ __device__ inline void weno_face_from_6(const Prim &q0, const Prim &q1,
   R.p = weno5_right(q1.p, q2.p, q3.p, q4.p, q5.p);
   R.ev = weno5_right(q1.ev, q2.ev, q3.ev, q4.ev, q5.ev);
 
-  prim_floor(L);
-  prim_floor(R);
+  prim_floor_fast(L);
+  prim_floor_fast(R);
 }
 
 __device__ inline Prim prim_at(const float *xi, const float *phix,
@@ -605,7 +617,7 @@ __device__ inline Prim prim_at(const float *xi, const float *phix,
                                const float *lam, const float *zet,
                                const uint8_t *solid, int x, int y, int z) {
   int i = idx3(x, y, z);
-  Prim q = log_to_prim(xi[i], phix[i], phiy[i], phiz[i], lam[i], zet[i]);
+  Prim q = log_to_prim_fast(xi[i], phix[i], phiy[i], phiz[i], lam[i], zet[i]);
   if (cell_is_solid(solid, x, y, z))
     apply_wall(q);
   return q;
@@ -620,7 +632,7 @@ __device__ inline Prim inflow_prim() {
   q.p = fmaxf(P.inflow_p, RHO_P_FLOOR);
   q.T = q.p / (q.r * P.R);
   q.ev = evib_eq(q.T);
-  q.Tv = Tv_from_evib_seed(q.ev, q.T);
+  q.Tv = 0.f;
   return q;
 }
 
@@ -630,12 +642,14 @@ __device__ inline Prim outflow_prim_characteristic(
   // nearest interior boundary state and one-cell-upwind state for
   // extrapolation slope
   int iR = idx3(P.nx - 1, y, z);
-  Prim qR = log_to_prim(xi[iR], phix[iR], phiy[iR], phiz[iR], lam[iR], zet[iR]);
+  Prim qR =
+      log_to_prim_fast(xi[iR], phix[iR], phiy[iR], phiz[iR], lam[iR], zet[iR]);
 
   Prim qL = qR;
   if (P.nx > 1) {
     int iL = idx3(P.nx - 2, y, z);
-    qL = log_to_prim(xi[iL], phix[iL], phiy[iL], phiz[iL], lam[iL], zet[iL]);
+    qL =
+        log_to_prim_fast(xi[iL], phix[iL], phiy[iL], phiz[iL], lam[iL], zet[iL]);
   }
 
   int g = xghost - (P.nx - 1);
@@ -649,7 +663,7 @@ __device__ inline Prim outflow_prim_characteristic(
   qEx.p = fmaxf(qR.p + gf * (qR.p - qL.p), RHO_P_FLOOR);
   qEx.T = qEx.p / (qEx.r * P.R);
   qEx.ev = fmaxf(qR.ev + gf * (qR.ev - qL.ev), 0.f);
-  qEx.Tv = Tv_from_evib_seed(qEx.ev, qEx.T);
+  qEx.Tv = 0.f;
 
   // far-field target used for incoming characteristics
   Prim qT = inflow_prim();
@@ -690,7 +704,7 @@ __device__ inline Prim outflow_prim_characteristic(
   q.w = qT.w + L4;
   q.T = q.p / (q.r * P.R);
   q.ev = fmaxf(qT.ev + L6, 0.f);
-  q.Tv = Tv_from_evib_seed(q.ev, q.T);
+  q.Tv = 0.f;
   return q;
 }
 
@@ -714,7 +728,7 @@ __device__ inline Prim prim_at_xbc(const float *xi, const float *phix,
     return outflow_prim_characteristic(xi, phix, phiy, phiz, lam, zet, x, y, z);
 
   int i = idx3(x, y, z);
-  Prim q = log_to_prim(xi[i], phix[i], phiy[i], phiz[i], lam[i], zet[i]);
+  Prim q = log_to_prim_fast(xi[i], phix[i], phiy[i], phiz[i], lam[i], zet[i]);
 
   if (cell_is_solid(solid, x, y, z))
     apply_wall(q);
@@ -977,7 +991,8 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
     } else {
       int gxc = (gx >= P.nx) ? (P.nx - 1) : gx;
       int gi = idx3(gxc, gyw, gzw);
-      q = log_to_prim(xi[gi], phix[gi], phiy[gi], phiz[gi], lam[gi], zet[gi]);
+      q = log_to_prim_fast(xi[gi], phix[gi], phiy[gi], phiz[gi], lam[gi],
+                           zet[gi]);
     }
     if (is_solid)
       apply_wall(q);
@@ -1219,7 +1234,7 @@ __global__ void k_outflow_reflection_metric(const float *xi, const float *phix,
     return;
 
   int i = idx3(x, y, z);
-  Prim q = log_to_prim(xi[i], phix[i], phiy[i], phiz[i], lam[i], zet[i]);
+  Prim q = log_to_prim_fast(xi[i], phix[i], phiy[i], phiz[i], lam[i], zet[i]);
   float p_ref = fmaxf(P.inflow_p, RHO_P_FLOOR);
   atomicMaxFloat(g_max_dp, fabsf(q.p - p_ref));
 }
