@@ -988,6 +988,9 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
     Prim q;
     if (gx < 0) {
       q = inflow_prim();
+    } else if (gx >= P.nx) {
+      q = outflow_prim_characteristic(xi, phix, phiy, phiz, lam, zet, gx, gyw,
+                                      gzw);
     } else {
       int gxc = (gx >= P.nx) ? (P.nx - 1) : gx;
       int gi = idx3(gxc, gyw, gzw);
