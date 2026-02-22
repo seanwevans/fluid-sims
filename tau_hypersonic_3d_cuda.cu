@@ -463,40 +463,9 @@ __device__ inline Cons hllc_flux_z(const Prim &L, const Prim &R) {
   return hllc_flux_axis(L, R, 2);
 }
 
-__device__ inline Prim limited_recon_x(Prim qm, Prim q0, Prim qp) {
-  Prim qL = q0;
-  Prim qR = q0;
-  float dr = minmod(q0.r - qm.r, qp.r - q0.r);
-  float du = minmod(q0.u - qm.u, qp.u - q0.u);
-  float dv = minmod(q0.v - qm.v, qp.v - q0.v);
-  float dw = minmod(q0.w - qm.w, qp.w - q0.w);
-  float dp = minmod(q0.p - qm.p, qp.p - q0.p);
-  float dev = minmod(q0.ev - qm.ev, qp.ev - q0.ev);
-  qL.r = q0.r - 0.5f * dr;
-  qR.r = q0.r + 0.5f * dr;
-  qL.u = q0.u - 0.5f * du;
-  qR.u = q0.u + 0.5f * du;
-  qL.v = q0.v - 0.5f * dv;
-  qR.v = q0.v + 0.5f * dv;
-  qL.w = q0.w - 0.5f * dw;
-  qR.w = q0.w + 0.5f * dw;
-  qL.p = q0.p - 0.5f * dp;
-  qR.p = q0.p + 0.5f * dp;
-  qL.ev = q0.ev - 0.5f * dev;
-  qR.ev = q0.ev + 0.5f * dev;
-  qL.r = fmaxf(qL.r, RHO_P_FLOOR);
-  qR.r = fmaxf(qR.r, RHO_P_FLOOR);
-  qL.p = fmaxf(qL.p, RHO_P_FLOOR);
-  qR.p = fmaxf(qR.p, RHO_P_FLOOR);
-  qL.ev = fmaxf(qL.ev, 0.f);
-  qR.ev = fmaxf(qR.ev, 0.f);
-  qL.T = qL.p / (qL.r * P.R);
-  qR.T = qR.p / (qR.r * P.R);
-  qL.Tv = Tv_from_evib_seed(qL.ev, qL.T);
-  qR.Tv = Tv_from_evib_seed(qR.ev, qR.T);
-  return qL;
-}
-
+// MUSCL fallback reconstruction: use recon_pair_x only when intentionally
+// running the 3-point minmod path. Prefer weno_face_from_6 for production
+// high-order face reconstruction.
 __device__ inline void recon_pair_x(const Prim &qm, const Prim &q0,
                                     const Prim &qp, Prim &L, Prim &R) {
   float dr = minmod(q0.r - qm.r, qp.r - q0.r);
