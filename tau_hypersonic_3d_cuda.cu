@@ -1,5 +1,11 @@
 // tau_hypersonic_3d_cuda.cu
 // nvcc -O3 -std=c++17 tau_hypersonic_3d_cuda.cu -o tau3d -lineinfo
+// Run: ./tau3d
+// Active solver pipeline (default): WENO5 reconstruction + HLLC flux + k_vis
+// diagnostics.
+// Legacy diagnostics/reconstruction are opt-in at compile time:
+//   -DENABLE_LEGACY_SCHLIEREN (unused k_schlieren kernel)
+//   -DENABLE_MUSCL_FALLBACK (unused recon_pair_x minmod fallback)
 
 #include "raylib.h"
 #include "rlgl.h"
@@ -476,9 +482,10 @@ __device__ inline Cons hllc_flux_z(const Prim &L, const Prim &R) {
   return hllc_flux_axis(L, R, 2);
 }
 
-// MUSCL fallback reconstruction: use recon_pair_x only when intentionally
-// running the 3-point minmod path. Prefer weno_face_from_6 for production
-// high-order face reconstruction.
+// Deprecated/experimental MUSCL fallback reconstruction.
+// Confirmed no active callsites in the default WENO5 + HLLC pipeline.
+// Keep only behind ENABLE_MUSCL_FALLBACK for controlled experiments.
+#if defined(ENABLE_MUSCL_FALLBACK)
 __device__ inline void recon_pair_x(const Prim &qm, const Prim &q0,
                                     const Prim &qp, Prim &L, Prim &R) {
   float dr = minmod(q0.r - qm.r, qp.r - q0.r);
@@ -515,6 +522,7 @@ __device__ inline void recon_pair_x(const Prim &qm, const Prim &q0,
   L.Tv = Tv_from_evib_seed(L.ev, L.T);
   R.Tv = Tv_from_evib_seed(R.ev, R.T);
 }
+#endif
 
 __device__ inline void apply_wall(Prim &q) {
   q.u = 0.f;
@@ -1175,6 +1183,10 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
   zet2[i] = zeta_from_evib(q1.ev);
 }
 
+// Deprecated/experimental schlieren magnitude kernel.
+// Confirmed no active callsites in the default visualization pipeline
+// (k_vis). Keep only behind ENABLE_LEGACY_SCHLIEREN for offline studies.
+#if defined(ENABLE_LEGACY_SCHLIEREN)
 __global__ void k_schlieren(const float *xi, float *out) {
   int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
   int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
@@ -1202,6 +1214,7 @@ __global__ void k_schlieren(const float *xi, float *out) {
   float g = sqrtf(drdx * drdx + drdy * drdy + drdz * drdz);
   out[idx3(x, y, z)] = g;
 }
+#endif
 
 __global__ void k_outflow_reflection_metric(const float *xi, const float *phix,
                                             const float *phiy,
