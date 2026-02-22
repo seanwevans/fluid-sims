@@ -47,17 +47,24 @@ struct Prim {
   float r, u, v, w, p, T, ev, Tv;
 };
 
-// Numerical/physical safety floors used by primitive/conservative conversion
-// and flux assembly. Keep these centralized so stability tuning stays explicit.
-// Smallest admissible density/pressure to preserve positive thermodynamic state.
+// Thermodynamic positivity floors: preserve realizable rho/p/e_th state during
+// primitive <-> conservative conversion and reconstruction clipping.
 constexpr float RHO_P_FLOOR = 1e-30f;
-// Smallest admissible translational thermal energy when recovering pressure.
 constexpr float THERMAL_ENERGY_FLOOR = 1e-12f;
-// Generic denominator guard for wave-speed formulas and normalization.
+
+// Denominator guards: avoid singular divisions while preserving equation sign
+// where flux-wave relations depend on directional information.
 constexpr float DENOM_EPS = 1e-12f;
-// Newton-iteration temperature floor for vibrational temperature inversion.
+
+// Vibrational temperature inversion control: keep Newton iterations in a
+// physically admissible positive-temperature range.
 constexpr float NEWTON_TEMP_FLOOR = 1e-6f;
-// Minimum vibrational relaxation time to cap source-term stiffness.
+
+// WENO smoothness epsilon: regularizes nonlinear weights near uniform states
+// without coupling stencil behavior to thermo/Newton tolerances.
+constexpr float WENO_EPS = 1e-6f;
+
+// Source-term stiffness limiter for vibrational relaxation.
 constexpr float TAU_VIB_MIN = 1e-9f;
 constexpr int WENO_HALO = 3;
 
@@ -146,6 +153,11 @@ __device__ inline float minmod(float a, float b) {
 
 __device__ inline float max3(float a, float b, float c) {
   return fmaxf(a, fmaxf(b, c));
+}
+
+__device__ inline float signed_denom_guard(float x) {
+  float ax = fabsf(x);
+  return copysignf(fmaxf(ax, DENOM_EPS), x);
 }
 
 __device__ inline int idx3(int x, int y, int z) {
@@ -396,7 +408,7 @@ __device__ inline Cons hllc_flux_axis(const Prim &L, const Prim &R, int axis) {
   float rL = L.r, rR = R.r;
   float pL = L.p, pR = R.p;
 
-  float denom = fmaxf(rL * (sL - unL) - rR * (sR - unR), DENOM_EPS);
+  float denom = signed_denom_guard(rL * (sL - unL) - rR * (sR - unR));
   float sM = (pR - pL + rL * unL * (sL - unL) - rR * unR * (sR - unR)) / denom;
 
   float pStarL = pL + rL * (sL - unL) * (sM - unL);
@@ -411,17 +423,17 @@ __device__ inline Cons hllc_flux_axis(const Prim &L, const Prim &R, int axis) {
   {
     Cons num = subC(mulC(FL, sR), mulC(FR, sL));
     Cons corr = mulC(subC(UR, UL), sL * sR);
-    FHLL = mulC(addC(num, corr), 1.f / fmaxf(sR - sL, DENOM_EPS));
+    FHLL = mulC(addC(num, corr), 1.f / signed_denom_guard(sR - sL));
   }
 
   if (sM >= 0.f) {
-    float rStar = rL * (sL - unL) / fmaxf(sL - sM, DENOM_EPS);
+    float starDenom = signed_denom_guard(sL - sM);
+    float rStar = rL * (sL - unL) / starDenom;
 
     float EL = UL.Et;
-    float EStar =
-        ((sL - unL) * EL - pL * unL + pStar * sM) / fmaxf(sL - sM, DENOM_EPS);
+    float EStar = ((sL - unL) * EL - pL * unL + pStar * sM) / starDenom;
 
-    float EvStar = UL.Ev * (sL - unL) / fmaxf(sL - sM, DENOM_EPS);
+    float EvStar = UL.Ev * (sL - unL) / starDenom;
 
     Cons UStar;
     UStar.r = rStar;
@@ -432,13 +444,13 @@ __device__ inline Cons hllc_flux_axis(const Prim &L, const Prim &R, int axis) {
     Cons FHLLC = addC(FL, mulC(subC(UStar, UL), sL));
     return addC(mulC(FHLLC, 1.f - alpha), mulC(FHLL, alpha));
   } else {
-    float rStar = rR * (sR - unR) / fmaxf(sR - sM, DENOM_EPS);
+    float starDenom = signed_denom_guard(sR - sM);
+    float rStar = rR * (sR - unR) / starDenom;
 
     float ER = UR.Et;
-    float EStar =
-        ((sR - unR) * ER - pR * unR + pStar * sM) / fmaxf(sR - sM, DENOM_EPS);
+    float EStar = ((sR - unR) * ER - pR * unR + pStar * sM) / starDenom;
 
-    float EvStar = UR.Ev * (sR - unR) / fmaxf(sR - sM, DENOM_EPS);
+    float EvStar = UR.Ev * (sR - unR) / starDenom;
 
     Cons UStar;
     UStar.r = rStar;
@@ -537,7 +549,7 @@ __device__ inline float weno5_left(float v0, float v1, float v2, float v3,
   float b2 = (13.f / 12.f) * (v2 - 2.f * v3 + v4) * (v2 - 2.f * v3 + v4) +
              0.25f * (3.f * v2 - 4.f * v3 + v4) * (3.f * v2 - 4.f * v3 + v4);
 
-  float eps = NEWTON_TEMP_FLOOR;
+  float eps = WENO_EPS;
   float a0 = 0.1f / ((eps + b0) * (eps + b0));
   float a1 = 0.6f / ((eps + b1) * (eps + b1));
   float a2 = 0.3f / ((eps + b2) * (eps + b2));
@@ -904,7 +916,7 @@ __global__ void k_init(float *xi, float *phix, float *phiy, float *phiz,
     q.w = 0.f;
     q.T = P.Twall;
     q.p = p;
-    q.r = fmaxf(q.p / (P.R * fmaxf(q.T, DENOM_EPS)), RHO_P_FLOOR);
+    q.r = fmaxf(q.p / (P.R * fmaxf(q.T, NEWTON_TEMP_FLOOR)), RHO_P_FLOOR);
     q.ev = evib_eq(q.T);
     q.Tv = q.T;
   }
