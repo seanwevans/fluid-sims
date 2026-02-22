@@ -1403,12 +1403,72 @@ int main() {
   ck(cudaMalloc(&d_reflect, sizeof(float)), "malloc reflect");
   ck(cudaMalloc(&d_solid, N * sizeof(uint8_t)), "malloc solid mask");
 
+  auto k_step_smem_for_block = [](dim3 b) {
+    return (size_t)(b.x + 2 * WENO_HALO) * (size_t)(b.y + 2 * WENO_HALO) *
+           (size_t)(b.z + 2 * WENO_HALO) *
+           (6 * sizeof(float) + sizeof(uint8_t));
+  };
+
   dim3 block(8, 8, 4);
+  size_t k_step_smem = k_step_smem_for_block(block);
+
+  int dev = 0;
+  ck(cudaGetDevice(&dev), "cudaGetDevice");
+
+  cudaDeviceProp prop{};
+  ck(cudaGetDeviceProperties(&prop, dev), "cudaGetDeviceProperties");
+
+  cudaFuncAttributes k_step_attr{};
+  ck(cudaFuncGetAttributes(&k_step_attr, k_step), "cudaFuncGetAttributes(k_step)");
+
+  size_t device_optin_limit =
+      prop.sharedMemPerBlockOptin > 0
+          ? (size_t)prop.sharedMemPerBlockOptin
+          : (size_t)prop.sharedMemPerBlock;
+  size_t kernel_dynamic_limit = (size_t)k_step_attr.maxDynamicSharedSizeBytes;
+  size_t effective_dynamic_limit =
+      std::min(device_optin_limit, kernel_dynamic_limit);
+
+  if (k_step_smem > effective_dynamic_limit) {
+    std::fprintf(stderr,
+                 "k_step dynamic shared-memory request too large for block=(%u,%u,%u): requested=%zu bytes, "
+                 "device_optin_limit=%zu bytes, kernel_limit=%zu bytes "
+                 "(effective=%zu bytes).\n",
+                 block.x, block.y, block.z, k_step_smem, device_optin_limit,
+                 kernel_dynamic_limit, effective_dynamic_limit);
+
+    const dim3 fallback_profiles[] = {dim3(8, 8, 4), dim3(8, 4, 4)};
+    bool selected = false;
+    for (dim3 candidate : fallback_profiles) {
+      size_t candidate_smem = k_step_smem_for_block(candidate);
+      std::fprintf(stderr,
+                   "  candidate block=(%u,%u,%u) requires %zu bytes %s\n",
+                   candidate.x, candidate.y, candidate.z, candidate_smem,
+                   candidate_smem <= effective_dynamic_limit ? "[fits]" :
+                                                                "[too large]");
+      if (!selected && candidate_smem <= effective_dynamic_limit) {
+        block = candidate;
+        k_step_smem = candidate_smem;
+        selected = true;
+      }
+    }
+
+    if (!selected) {
+      std::fprintf(stderr,
+                   "No supported fallback block profile found. Reduce block "
+                   "dimensions or lower per-thread shared-memory usage.\n");
+      std::exit(1);
+    }
+
+    std::fprintf(stderr,
+                 "Auto-selected fallback block=(%u,%u,%u), k_step_smem=%zu "
+                 "bytes.\n",
+                 block.x, block.y, block.z, k_step_smem);
+  }
+
   dim3 grid((hp.nx + block.x - 1) / block.x, (hp.ny + block.y - 1) / block.y,
             (hp.nz + block.z - 1) / block.z);
-  size_t k_step_smem =
-      (size_t)(block.x + 2 * WENO_HALO) * (size_t)(block.y + 2 * WENO_HALO) *
-      (size_t)(block.z + 2 * WENO_HALO) * (6 * sizeof(float) + sizeof(uint8_t));
+
   ck(cudaFuncSetAttribute(k_step, cudaFuncAttributeMaxDynamicSharedMemorySize,
                           (int)k_step_smem),
      "k_step shared-memory attribute");
