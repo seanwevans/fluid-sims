@@ -49,24 +49,11 @@ struct Prim {
   float r, u, v, w, p, T, ev, Tv;
 };
 
-// Thermodynamic positivity floors: preserve realizable rho/p/e_th state during
-// primitive <-> conservative conversion and reconstruction clipping.
 constexpr float RHO_P_FLOOR = 1e-30f;
 constexpr float THERMAL_ENERGY_FLOOR = 1e-12f;
-
-// Denominator guards: avoid singular divisions while preserving equation sign
-// where flux-wave relations depend on directional information.
 constexpr float DENOM_EPS = 1e-12f;
-
-// Vibrational temperature inversion control: keep Newton iterations in a
-// physically admissible positive-temperature range.
 constexpr float NEWTON_TEMP_FLOOR = 1e-6f;
-
-// WENO smoothness epsilon: regularizes nonlinear weights near uniform states
-// without coupling stencil behavior to thermo/Newton tolerances.
 constexpr float WENO_EPS = 1e-6f;
-
-// Source-term stiffness limiter for vibrational relaxation.
 constexpr float TAU_VIB_MIN = 1e-9f;
 constexpr int WENO_HALO = 3;
 
@@ -195,7 +182,6 @@ __device__ inline bool cell_is_solid(const uint8_t *solid, int x, int y,
   if (x >= 0 && x < P.nx && y >= 0 && y < P.ny && z >= 0 && z < P.nz)
     return solid[idx3(x, y, z)] != 0;
 
-  // Ghost lookups only happen near x boundaries; keep this fallback rare.
   float X = (x + 0.5f) * P.dx;
   float Y = (y + 0.5f) * P.dy;
   float Z = (z + 0.5f) * P.dz;
@@ -593,8 +579,6 @@ __device__ inline void weno_face_from_6(const Prim &q0, const Prim &q1,
                                         const Prim &q2, const Prim &q3,
                                         const Prim &q4, const Prim &q5, Prim &L,
                                         Prim &R) {
-  // Interface between q2 (cell i) and q3 (cell i+1)
-  // L uses q0..q4 (i-2..i+2), R uses q1..q5 (i-1..i+3)
   L.r = weno5_left(q0.r, q1.r, q2.r, q3.r, q4.r);
   L.u = weno5_left(q0.u, q1.u, q2.u, q3.u, q4.u);
   L.v = weno5_left(q0.v, q1.v, q2.v, q3.v, q4.v);
@@ -640,8 +624,6 @@ __device__ inline Prim inflow_prim() {
 __device__ inline Prim outflow_prim_characteristic(
     const float *xi, const float *phix, const float *phiy, const float *phiz,
     const float *lam, const float *zet, int xghost, int y, int z) {
-  // nearest interior boundary state and one-cell-upwind state for
-  // extrapolation slope
   int iR = idx3(P.nx - 1, y, z);
   Prim qR =
       log_to_prim_fast(xi[iR], phix[iR], phiy[iR], phiz[iR], lam[iR], zet[iR]);
@@ -666,25 +648,22 @@ __device__ inline Prim outflow_prim_characteristic(
   qEx.ev = fmaxf(qR.ev + gf * (qR.ev - qL.ev), 0.f);
   qEx.Tv = 0.f;
 
-  // far-field target used for incoming characteristics
   Prim qT = inflow_prim();
 
   float rho_ref = fmaxf(qR.r, RHO_P_FLOOR);
   float a_ref = soundspeed(qR);
-  float un = qR.u; // x-normal velocity at outflow
+  float un = qR.u;
 
-  // primitive perturbation relative to target, projected to 1D Euler
-  // characteristics in x.
   float drho = qEx.r - qT.r;
   float du = qEx.u - qT.u;
   float dp = qEx.p - qT.p;
 
-  float L1 = 0.5f * (dp / (a_ref * a_ref) - rho_ref * du / a_ref); // u-a
-  float L5 = 0.5f * (dp / (a_ref * a_ref) + rho_ref * du / a_ref); // u+a
-  float L2 = drho - dp / (a_ref * a_ref);                          // u
-  float L3 = qEx.v - qT.v;                                         // u
-  float L4 = qEx.w - qT.w;                                         // u
-  float L6 = qEx.ev - qT.ev;                                       // u
+  float L1 = 0.5f * (dp / (a_ref * a_ref) - rho_ref * du / a_ref);
+  float L5 = 0.5f * (dp / (a_ref * a_ref) + rho_ref * du / a_ref);
+  float L2 = drho - dp / (a_ref * a_ref);
+  float L3 = qEx.v - qT.v;
+  float L4 = qEx.w - qT.w;
+  float L6 = qEx.ev - qT.ev;
 
   if (un - a_ref < 0.f)
     L1 = 0.f;
@@ -718,22 +697,19 @@ outflow_prim_transmissive(const float *xi, const float *phix, const float *phiy,
   Prim qR =
       log_to_prim_fast(xi[iR], phix[iR], phiy[iR], phiz[iR], lam[iR], zet[iR]);
 
-  Prim q = qR; // zero-gradient ghost fill (NO linear extrapolation)
+  Prim q = qR;
 
   float aR = soundspeed(qR);
   float un = qR.u;
 
-  // If backflow, treat as inflow (otherwise you *will* get junk entering)
   if (un < 0.0f) {
     Prim qi = inflow_prim();
     return qi;
   }
 
-  // Subsonic outflow: 1 incoming characteristic -> specify pressure only.
-  // Don't hard-pin; relax it to reduce reflections.
   if (un < aR) {
     float p_amb = fmaxf(P.inflow_p, RHO_P_FLOOR);
-    float relax = 0.05f; // 0..1 (smaller = gentler, less reflective)
+    float relax = 0.05f;
     q.p = fmaxf(q.p + relax * (p_amb - q.p), RHO_P_FLOOR);
   }
 
@@ -749,21 +725,20 @@ __device__ inline Prim prim_at_xbc(const float *xi, const float *phix,
                                    const float *phiy, const float *phiz,
                                    const float *lam, const float *zet,
                                    const uint8_t *solid, int x, int y, int z) {
-  // y,z periodic
+
   y = wrapi(y, P.ny);
   z = wrapi(z, P.nz);
 
   if (x < 0) {
     Prim q = inflow_prim();
-    // still enforce internal solid if you want it to block inflow stencils
+
     if (cell_is_solid(solid, x, y, z))
       apply_wall(q);
     return q;
   }
 
   if (x >= P.nx) {
-    // return outflow_prim_characteristic(xi, phix, phiy, phiz, lam, zet, x, y,
-    // z);
+
     return outflow_prim_transmissive(xi, phix, phiy, phiz, lam, zet, x, y, z);
   }
 
@@ -833,18 +808,15 @@ __global__ void k_vis(const float *xi, const float *phix, const float *phiy,
 
   int i = idx3(x, y, z);
 
-  // mask solid interior so it doesn't dominate visuals
   if (solid[i]) {
     out[i] = 0.f;
     return;
   }
 
-  // periodic y,z neighbors (x uses inflow/outflow helper)
   int xm = x - 1, xp = x + 1;
   int ym = wrapi(y - 1, P.ny), yp = wrapi(y + 1, P.ny);
   int zm = wrapi(z - 1, P.nz), zp = wrapi(z + 1, P.nz);
 
-  // For anything needing primitives, use BC-aware accessor
   Prim q0 = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, y, z);
 
   if (mode == VIS_LOG_RHO) {
@@ -867,7 +839,6 @@ __global__ void k_vis(const float *xi, const float *phix, const float *phiy,
     return;
   }
 
-  // Need neighbors for derivatives (curl/div/Q/schlieren)
   Prim qxm = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, xm, y, z);
   Prim qxp = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, xp, y, z);
   Prim qym = prim_at_xbc(xi, phix, phiy, phiz, lam, zet, solid, x, ym, z);
@@ -879,7 +850,6 @@ __global__ void k_vis(const float *xi, const float *phix, const float *phiy,
   float inv2dy = 0.5f / P.dy;
   float inv2dz = 0.5f / P.dz;
 
-  // velocity gradients
   float dudx = (qxp.u - qxm.u) * inv2dx;
   float dudy = (qyp.u - qym.u) * inv2dy;
   float dudz = (qzp.u - qzm.u) * inv2dz;
@@ -897,7 +867,6 @@ __global__ void k_vis(const float *xi, const float *phix, const float *phiy,
     return;
   }
 
-  // vorticity = curl(u)
   float wx = dwdy - dvdz;
   float wy = dudz - dwdx;
   float wz = dvdx - dudy;
@@ -929,7 +898,6 @@ __global__ void k_vis(const float *xi, const float *phix, const float *phiy,
     return;
   }
 
-  // default: schlieren of density |∇ρ|
   float drdx = (qxp.r - qxm.r) * inv2dx;
   float drdy = (qyp.r - qym.r) * inv2dy;
   float drdz = (qzp.r - qzm.r) * inv2dz;
@@ -978,12 +946,9 @@ __global__ void k_init(float *xi, float *phix, float *phiy, float *phiz,
 
   int i = idx3(x, y, z);
 
-  // Ambient thermodynamic state = inflow (no initial pressure mismatch)
   float r = fmaxf(P.inflow_r, RHO_P_FLOOR);
   float p = fmaxf(P.inflow_p, RHO_P_FLOOR);
 
-  // Start at rest everywhere to avoid an impulsive "sphere appears in a moving
-  // flow"
   float u = 0.0f, v = 0.0f, w = 0.0f;
 
   Prim q{};
@@ -996,14 +961,11 @@ __global__ void k_init(float *xi, float *phix, float *phiy, float *phiz,
   q.ev = evib_eq(q.T);
   q.Tv = Tv_from_evib_seed(q.ev, q.T);
 
-  // Pre-apply the wall state in the solid so the solver doesn't "discover" it
-  // at t=0
   float X = (x + 0.5f) * P.dx;
   float Y = (y + 0.5f) * P.dy;
   float Z = (z + 0.5f) * P.dz;
   if (solid[i]) {
-    // Keep pressure matched to ambient to prevent an artificial blast
-    // by choosing wall density consistent with (p = rho R Twall).
+
     q.u = 0.f;
     q.v = 0.f;
     q.w = 0.f;
@@ -1072,8 +1034,7 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
     if (gx < 0) {
       q = inflow_prim();
     } else if (gx >= P.nx) {
-      // q = outflow_prim_characteristic(xi, phix, phiy, phiz, lam, zet, gx,
-      // gyw, gzw);
+
       q = outflow_prim_transmissive(xi, phix, phiy, phiz, lam, zet, gx, gyw,
                                     gzw);
     } else {
@@ -1100,7 +1061,7 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
 
   int i = idx3(x, y, z);
   if (solid[i]) {
-    // Keep solid state fixed (or re-impose a consistent wall state).
+
     xi2[i] = xi[i];
     phix2[i] = phix[i];
     phiy2[i] = phiy[i];
@@ -1132,8 +1093,6 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
     return s_solid[j] != 0;
   };
   auto any_solid_line = [&](int ax, int ay, int az, int bx, int by, int bz) {
-    // inclusive segment from a..b in local offsets; assumes axis-aligned usage
-    // below
     int dx = (bx > ax) - (bx < ax);
     int dy = (by > ay) - (by < ay);
     int dz = (bz > az) - (bz < az);
@@ -1142,7 +1101,7 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
 
     int n = max3(abs(x1 - x0), abs(y1 - y0), abs(z1 - z0));
 #pragma unroll
-    for (int k = 0; k <= 6; k++) { // max span we use here is 6 steps
+    for (int k = 0; k <= 6; k++) {
       if (k > n)
         break;
       if (solid_sh(x0 + k * dx, y0 + k * dy, z0 + k * dz))
@@ -1163,16 +1122,15 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
     Prim qx_p2 = prim_sh(2, 0, 0);
     Prim qx_p3 = prim_sh(3, 0, 0);
 
-    // ---- Fx_m : interface between x-1 and x ----
     bool face_solid_m = solid_sh(-1, 0, 0) || solid_sh(0, 0, 0);
-    bool stencil_solid_m = any_solid_line(-3, 0, 0, 2, 0, 0); // qx_m3..qx_p2
+    bool stencil_solid_m = any_solid_line(-3, 0, 0, 2, 0, 0);
 
     if (face_solid_m) {
-      Prim R = q0;                // cell (x)
-      Prim L = mirror_wall(R, 0); // ghost on (x-1) side
+      Prim R = q0;
+      Prim L = mirror_wall(R, 0);
       Fx_m = hllc_flux_x(L, R);
     } else if (stencil_solid_m) {
-      // first-order fallback: L from cell x-1, R from cell x
+
       Prim L = qx_m1;
       Prim R = qx_0;
       prim_floor_fast(L);
@@ -1184,16 +1142,15 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
       Fx_m = hllc_flux_x(L, R);
     }
 
-    // ---- Fx_p : interface between x and x+1 ----
     bool face_solid_p = solid_sh(0, 0, 0) || solid_sh(1, 0, 0);
-    bool stencil_solid_p = any_solid_line(-2, 0, 0, 3, 0, 0); // qx_m2..qx_p3
+    bool stencil_solid_p = any_solid_line(-2, 0, 0, 3, 0, 0);
 
     if (face_solid_p) {
-      Prim L = q0;                // cell (x)
-      Prim R = mirror_wall(L, 0); // ghost on (x+1) side
+      Prim L = q0;
+      Prim R = mirror_wall(L, 0);
       Fx_p = hllc_flux_x(L, R);
     } else if (stencil_solid_p) {
-      // first-order fallback: L from cell x, R from cell x+1
+
       Prim L = qx_0;
       Prim R = qx_p1;
       prim_floor_fast(L);
@@ -1216,16 +1173,15 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
     Prim qy_p2 = prim_sh(0, 2, 0);
     Prim qy_p3 = prim_sh(0, 3, 0);
 
-    // ---- Fy_m : interface between y-1 and y ----
     bool face_solid_m = solid_sh(0, -1, 0) || solid_sh(0, 0, 0);
-    bool stencil_solid_m = any_solid_line(0, -3, 0, 0, 2, 0); // qy_m3..qy_p2
+    bool stencil_solid_m = any_solid_line(0, -3, 0, 0, 2, 0);
 
     if (face_solid_m) {
       Prim R = q0;
       Prim L = mirror_wall(R, 1);
       Fy_m = hllc_flux_y(L, R);
     } else if (stencil_solid_m) {
-      // first-order fallback: L from cell y-1, R from cell y
+
       Prim L = qy_m1;
       Prim R = qy_0;
       prim_floor_fast(L);
@@ -1237,16 +1193,15 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
       Fy_m = hllc_flux_y(L, R);
     }
 
-    // ---- Fy_p : interface between y and y+1 ----
     bool face_solid_p = solid_sh(0, 0, 0) || solid_sh(0, 1, 0);
-    bool stencil_solid_p = any_solid_line(0, -2, 0, 0, 3, 0); // qy_m2..qy_p3
+    bool stencil_solid_p = any_solid_line(0, -2, 0, 0, 3, 0);
 
     if (face_solid_p) {
       Prim L = q0;
       Prim R = mirror_wall(L, 1);
       Fy_p = hllc_flux_y(L, R);
     } else if (stencil_solid_p) {
-      // first-order fallback: L from cell y, R from cell y+1
+
       Prim L = qy_0;
       Prim R = qy_p1;
       prim_floor_fast(L);
@@ -1269,9 +1224,8 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
     Prim qz_p2 = prim_sh(0, 0, 2);
     Prim qz_p3 = prim_sh(0, 0, 3);
 
-    // ---- Fz_m : interface between z-1 and z ----
     bool face_solid_m = solid_sh(0, 0, -1) || solid_sh(0, 0, 0);
-    bool stencil_solid_m = any_solid_line(0, 0, -3, 0, 0, 2); // qz_m3..qz_p2
+    bool stencil_solid_m = any_solid_line(0, 0, -3, 0, 0, 2);
 
     if (face_solid_m) {
       Prim R = q0;
@@ -1289,9 +1243,8 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
       Fz_m = hllc_flux_z(L, R);
     }
 
-    // ---- Fz_p : interface between z and z+1 ----
     bool face_solid_p = solid_sh(0, 0, 0) || solid_sh(0, 0, 1);
-    bool stencil_solid_p = any_solid_line(0, 0, -2, 0, 0, 3); // qz_m2..qz_p3
+    bool stencil_solid_p = any_solid_line(0, 0, -2, 0, 0, 3);
 
     if (face_solid_p) {
       Prim L = q0;
@@ -1339,13 +1292,11 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
                 0.f);
   q1.Tv = Tv_from_evib_seed(q1.ev, q1.T);
 
-  // Sponge near inflow boundary (x small): gently relax toward ramped inflow
-  // state. This prevents a startup blast and reduces reflections.
   int nsp = (P.sponge_n > 0) ? P.sponge_n : 0;
   if (nsp > 0 && x < nsp) {
-    float s = 1.0f - (float)x / (float)nsp; // 1 at x=0 -> 0 at x=nsp
+    float s = 1.0f - (float)x / (float)nsp;
     s = fminf(fmaxf(s, 0.0f), 1.0f);
-    float k = P.sponge_strength * (s * s); // stronger right at boundary
+    float k = P.sponge_strength * (s * s);
 
     Prim tgt{};
     tgt.r = fmaxf(P.inflow_r, RHO_P_FLOOR);
@@ -1357,7 +1308,6 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
     tgt.ev = evib_eq(tgt.T);
     tgt.Tv = Tv_from_evib_seed(tgt.ev, tgt.T);
 
-    // blend primitives (simple, effective for a sponge)
     q1.r = fmaxf(q1.r + k * (tgt.r - q1.r), RHO_P_FLOOR);
     q1.p = fmaxf(q1.p + k * (tgt.p - q1.p), RHO_P_FLOOR);
     q1.u = q1.u + k * (tgt.u - q1.u);
@@ -1369,16 +1319,15 @@ __global__ void k_step(const float *xi, const float *phix, const float *phiy,
   }
   int nspo = (P.sponge_out_n > 0) ? P.sponge_out_n : 0;
   if (nspo > 0 && x >= (P.nx - nspo)) {
-    int xo = x - (P.nx - nspo);        // 0 at start of out-sponge
-    float s = (float)xo / (float)nspo; // 0 -> 1 toward boundary
+    int xo = x - (P.nx - nspo);
+    float s = (float)xo / (float)nspo;
     s = fminf(fmaxf(s, 0.0f), 1.0f);
     float k = P.sponge_out_strength * (s * s);
 
-    // target = ambient (or a low-disturbance reference state)
     Prim tgt{};
     tgt.r = fmaxf(P.inflow_r, RHO_P_FLOOR);
     tgt.p = fmaxf(P.inflow_p, RHO_P_FLOOR);
-    tgt.u = 0.0f; // key: bleed velocity to 0 near boundary
+    tgt.u = 0.0f;
     tgt.v = 0.0f;
     tgt.w = 0.0f;
     tgt.T = tgt.p / (tgt.r * P.R);
@@ -1483,7 +1432,7 @@ static void slice_to_rgba(uint32_t *dst_rgba, const float *vol, int nx, int ny,
     v = log_scale ? safe_log1p(v) : v;
     float t = clamp01((v - mn) * inv);
 
-    float a = clamp01(a_gain * (t * t)); // emphasize structures
+    float a = clamp01(a_gain * (t * t));
     unsigned char c = (unsigned char)(t * 255.0f);
     unsigned char A = (unsigned char)(a * 255.0f);
 
@@ -1580,13 +1529,13 @@ static const char *vis_name(int m) {
 
 int main() {
   Params hp{};
-  hp.nx = 128;
-  hp.ny = 128;
-  hp.nz = 128;
+  hp.nx = 64;
+  hp.ny = 64;
+  hp.nz = 64;
   hp.dx = 1.f / hp.nx;
   hp.dy = 1.f / hp.ny;
   hp.dz = 1.f / hp.nz;
-  hp.cfl = 0.35f;
+  hp.cfl = 0.3333f;
   hp.u_ref = 10.f;
   hp.R = 10.f;
   hp.gamma_floor = 1.1f;
@@ -1659,7 +1608,7 @@ int main() {
   std::vector<uint32_t> h_rgba((size_t)hp.nx * (size_t)hp.ny);
 
   InitWindow(1280, 720, "tau3d volume");
-  SetTargetFPS(99999);
+  SetTargetFPS(24);
 
   Camera3D cam{};
   cam.position = Vector3{1.8f, 1.2f, 1.8f};
@@ -1746,10 +1695,13 @@ int main() {
            "get maxs");
 
         float dt_cfl = hp.cfl / fmaxf(maxs, 1e-9f);
-        if (dt > dt_cfl)
-          d_tau *= 0.5f;
-        else if (dt < 0.25f * dt_cfl)
-          d_tau *= 1.2f;
+
+        if (dt > 1.10f * dt_cfl)
+          d_tau *= 0.80f;
+        else if (dt < 0.85f * dt_cfl)
+          d_tau *= 1.10f;
+
+        d_tau = fminf(fmaxf(d_tau, 1e-7f), 5e-2f);
 
         std::swap(d_xi, d_xi2);
         std::swap(d_phix, d_phix2);
@@ -1798,7 +1750,7 @@ int main() {
     rlDisableBackfaceCulling();
     rlEnableColorBlend();
 
-    unsigned char alphaMul = 255; // extra global alpha knob if you want
+    unsigned char alphaMul = 255;
     for (int zi = 0; zi < hp.nz; zi += z_stride) {
       int z = order[zi];
       float zz = (z + 0.5f) / (float)hp.nz;
