@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>4Splat 3D Viewer</title>
+    <style>
+        body { margin: 0; background-color: #111; color: white; font-family: monospace; overflow: hidden; }
+        #info { position: absolute; top: 10px; left: 10px; z-index: 100; pointer-events: none; }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="info">Loading .4spl data...</div>
+    
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        let scene, camera, renderer, instancedMesh, controls;
+        let videoData = null;
+        let currentFrame = 0;
+        let lastFrameTime = 0;
+        const FPS = 15; // Target playback speed
+
+        init();
+
+        async function init() {
+            // 1. Setup Three.js Scene
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(40, 40, 80);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.target.set(32, 32, 32); // Center of the 64x64x64 volume
+            controls.update();
+
+            window.addEventListener('resize', onWindowResize);
+
+            // 2. Fetch and Parse .4spl file
+            try {
+                const response = await fetch('./tau_hypersonic.4spl');
+                if (!response.ok) throw new Error("Failed to load file");
+                const buffer = await response.arrayBuffer();
+                parse4Splat(buffer);
+                
+                // 3. Build Instanced Mesh
+                buildVolume();
+                
+                // 4. Start Loop
+                renderer.setAnimationLoop(animate);
+            } catch (err) {
+                document.getElementById('info').innerText = "Error: " + err.message + "\n(Are you running a local web server?)";
+            }
+        }
+
+        function parse4Splat(buffer) {
+            const dv = new DataView(buffer);
+            
+            // Header (32 bytes)
+            const width = dv.getUint32(8, true);
+            const height = dv.getUint32(12, true);
+            const depth = dv.getUint32(16, true);
+            const frames = dv.getUint32(20, true);
+            const pSize = dv.getUint32(24, true);
+
+            // Palette (pSize * 48 bytes per entry)
+            // Splat4D struct floats: mu_x, sigma_x, mu_y, sigma_y, mu_z, sigma_z, mu_t, sigma_t, r, g, b, alpha
+            const paletteOffset = 32;
+            const palette = [];
+            let pOff = paletteOffset;
+            for (let i = 0; i < pSize; i++) {
+                const r = dv.getFloat32(pOff + 32, true);
+                const g = dv.getFloat32(pOff + 36, true);
+                const b = dv.getFloat32(pOff + 40, true);
+                palette.push(new THREE.Color(r, g, b));
+                pOff += 48;
+            }
+
+            // Indices (1 byte per voxel per frame)
+            const indicesOffset = paletteOffset + (pSize * 48);
+            const voxelsPerFrame = width * height * depth;
+            const indices = new Uint8Array(buffer, indicesOffset, voxelsPerFrame * frames);
+
+            videoData = { width, height, depth, frames, palette, indices, voxelsPerFrame };
+        }
+
+        function buildVolume() {
+            const geometry = new THREE.BoxGeometry(1, 1, 1);
+            // Use Additive Blending to make overlapping heat look fiery
+            const material = new THREE.MeshBasicMaterial({ 
+                blending: THREE.AdditiveBlending,
+                transparent: true,
+                opacity: 0.8
+            });
+
+            instancedMesh = new THREE.InstancedMesh(geometry, material, videoData.voxelsPerFrame);
+            instancedMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+            
+            // FIX: Manually allocate the color buffer before setting its usage
+            const colorArray = new Float32Array(videoData.voxelsPerFrame * 3);
+            instancedMesh.instanceColor = new THREE.InstancedBufferAttribute(colorArray, 3);
+            instancedMesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
+            
+            scene.add(instancedMesh);
+            updateFrame(0);
+        }
+
+        function updateFrame(frameIdx) {
+            const { width, height, depth, palette, indices, voxelsPerFrame } = videoData;
+            const offset = frameIdx * voxelsPerFrame;
+            
+            const dummy = new THREE.Object3D();
+            const color = new THREE.Color();
+            
+            // Render thresholds to hide empty space
+            const NOISE_FLOOR = 15; 
+
+            for (let z = 0; z < depth; z++) {
+                for (let y = 0; y < height; y++) {
+                    for (let x = 0; x < width; x++) {
+                        const i = (z * height + y) * width + x;
+                        const pIdx = indices[offset + i];
+
+                        if (pIdx > NOISE_FLOOR) {
+                            dummy.position.set(x, y, z);
+                            dummy.scale.set(1, 1, 1);
+                            color.copy(palette[pIdx]);
+                        } else {
+                            // Hide voxel
+                            dummy.scale.set(0, 0, 0); 
+                        }
+
+                        dummy.updateMatrix();
+                        instancedMesh.setMatrixAt(i, dummy.matrix);
+                        instancedMesh.setColorAt(i, color);
+                    }
+                }
+            }
+
+            instancedMesh.instanceMatrix.needsUpdate = true;
+            instancedMesh.instanceColor.needsUpdate = true;
+            
+            document.getElementById('info').innerText = `Frame: ${frameIdx + 1} / ${videoData.frames}`;
+        }
+
+        function animate(time) {
+            controls.update();
+
+            // Handle playback framerate
+            if (time - lastFrameTime > 1000 / FPS) {
+                currentFrame = (currentFrame + 1) % videoData.frames;
+                updateFrame(currentFrame);
+                lastFrameTime = time;
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+    </script>
+</body>
+</html>
