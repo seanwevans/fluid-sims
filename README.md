@@ -28,6 +28,17 @@ Video: A CUDA-based 2-D fluid dynamics simulator
 
 https://github.com/user-attachments/assets/b7bbda96-7fec-4abb-9a80-bc461a0edaa6
 
+
+Video: Hybrid CUDA FLIP/APIC particle-grid incompressible fluid simulator (build `tau_flip_apic`)
+
+```bash
+nvcc -std=c++17 -O3 -use_fast_math -arch=sm_86 tau_flip_apic.cu -o tau_flip_apic -lncursesw
+./tau_flip_apic --particles 65536 --grid 128 --apic 0.85 --flip 0.97
+./tau_flip_apic --headless --steps 600 --stride 20
+```
+
+`tau_flip_apic.cu` adds a hybrid solver: particles carry advection state, P2G transfers mass/momentum plus APIC affine velocity to a background grid, Jacobi pressure projection enforces incompressibility, and G2P blends low-dissipation FLIP velocity deltas with PIC stability.
+
 ## Hypersonic CUDA regression test bed
 
 `tau_hypersonic_cuda_tests.cu` now supports a small deterministic regression harness for `tau_hypersonic_cuda.cu`:
