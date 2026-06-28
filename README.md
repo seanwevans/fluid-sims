@@ -28,6 +28,11 @@ Video: A CUDA-based 2-D fluid dynamics simulator
 
 https://github.com/user-attachments/assets/b7bbda96-7fec-4abb-9a80-bc461a0edaa6
 
+
+Video: CUDA D2Q9 Lattice Boltzmann Method simulator (build `tau_lbm`)
+
+Run with `nvcc -std=c++17 -O3 -use_fast_math -o tau_lbm tau_lbm.cu -lncursesw` and `./tau_lbm`.
+
 ## Hypersonic CUDA regression test bed
 
 `tau_hypersonic_cuda_tests.cu` now supports a small deterministic regression harness for `tau_hypersonic_cuda.cu`:
