@@ -43,3 +43,21 @@ nvcc -O2 -std=c++17 -o tau_hypersonic_cuda_tests tau_hypersonic_cuda_tests.cu
 ./tau_hypersonic_cuda_tests --steps 24 --write-baseline --baseline tau_hypersonic_cuda_baseline.txt
 ./tau_hypersonic_cuda_tests --steps 24 --verify-baseline --baseline tau_hypersonic_cuda_baseline.txt
 ```
+
+## Ideal MHD demo
+
+`tau_mhd.c` adds a 2-D ideal magnetohydrodynamics plasma demo. It extends the
+conservative state with in-plane magnetic fields and a GLM cleaning scalar,
+uses MUSCL reconstruction, an HLLD-oriented ideal-MHD interface wave model with
+a positivity-preserving HLL fallback, and hyperbolic/parabolic GLM damping to
+control numerical `div(B)` error.
+
+Build on a machine with raylib installed:
+
+```bash
+gcc -O3 tau_mhd.c -lraylib -lm -o tau_mhd
+./tau_mhd
+```
+
+Controls: `SPACE` pauses, `R` resets, `M` cycles density/pressure/field/divergence
+views, and `C` switches between a Brio-Wu-style shock tube and Orszag-Tang vortex.
