@@ -13,6 +13,9 @@
 CC      = gcc
 NVCC    = nvcc
 
+# Host compiler nvcc hands C++ off to (overridable for CI).
+CCBIN   ?= g++-10
+
 # ---------------------------------------------------------------------------
 # Binaries
 # ---------------------------------------------------------------------------
@@ -25,10 +28,19 @@ CUDA_BINS := jsc jsc3d tau_burgers tgs tau3d tau_2d_hypersonic_cuda \
 # th3cs also needs 4splat.c, so it is kept out of the default group and built
 # explicitly with `make th3cs`.
 
-.PHONY: all cpu cuda clean
+.PHONY: all cpu cuda test clean
 all: cpu cuda
 cpu: $(CPU_BINS)
 cuda: $(CUDA_BINS)
+
+# Build and run the hypersonic CUDA regression + unit test suite.
+# Requires a CUDA-capable GPU at runtime; writes a fresh baseline and then
+# verifies the same run against it (round-trip self-check).
+BASELINE ?= tau_hypersonic_cuda_baseline.txt
+TEST_STEPS ?= 24
+test: tau_hypersonic_cuda_tests
+	./tau_hypersonic_cuda_tests --steps $(TEST_STEPS) --write-baseline  --baseline $(BASELINE)
+	./tau_hypersonic_cuda_tests --steps $(TEST_STEPS) --verify-baseline --baseline $(BASELINE)
 
 # ---------------------------------------------------------------------------
 # CPU targets (gcc)
@@ -64,7 +76,7 @@ tau_burgers: tau_burgers.cu
 	$(NVCC) -std=c++17 -O3 -use_fast_math -arch=sm_86 -lineinfo -o $@ $< -lncursesw
 
 tgs: tau_gray_scott.cu
-	$(NVCC) -std=c++17 -ccbin g++-10 -O3 -use_fast_math -arch=sm_86 -lineinfo $< -lncursesw -o $@
+	$(NVCC) -std=c++17 -ccbin $(CCBIN) -O3 -use_fast_math -arch=sm_86 -lineinfo $< -lncursesw -o $@
 
 tau3d: tau_hypersonic_3d_cuda.cu
 	$(NVCC) -O3 -std=c++17 $< -o $@ -lineinfo
@@ -86,4 +98,4 @@ th3cs: th3cs.cu 4splat.c
 
 # ---------------------------------------------------------------------------
 clean:
-	$(RM) $(CPU_BINS) $(CUDA_BINS) th3cs
+	$(RM) $(CPU_BINS) $(CUDA_BINS) th3cs $(BASELINE)

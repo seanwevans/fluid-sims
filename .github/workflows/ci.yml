@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    name: Build CPU demos (gcc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libraylib-dev libncurses-dev \
+            libgl1-mesa-dev libx11-dev
+
+      - name: Build
+        run: make cpu
+
+  cuda:
+    name: Build CUDA demos + tests (nvcc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          method: network
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            g++-12 libraylib-dev libncurses-dev \
+            libgl1-mesa-dev libx11-dev
+
+      # nvcc can compile and link the CUDA demos and the test harness without a
+      # GPU present; only running the test binary needs a device.
+      - name: Build CUDA demos
+        run: make cuda CCBIN=g++-12
+
+      - name: Build test harness
+        run: make tau_hypersonic_cuda_tests
+
+      - name: Run regression + unit tests (only if a GPU is available)
+        run: |
+          if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+            make test
+          else
+            echo "No CUDA-capable GPU on this runner; tests were compiled but not executed."
+          fi
