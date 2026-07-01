@@ -583,7 +583,7 @@ int main(int argc, char **argv) {
       nrho[i] = 1.0;
       nmx[i] = 0.0;
       nmy[i] = 0.0;
-      nE[i] = prim_to_cons(Prim{1.0, 0.0, 0.0, 1.0}).E;
+      nE[i] = 1.0 / (cfg.gamma - 1.0); // rest state (rho=1, u=v=0, p=1)
       nmask[i] = 0;
     }
 
@@ -596,6 +596,11 @@ int main(int argc, char **argv) {
     nmx[i_right] = 7.0;
     nmask[i_up] = 1;
 
+    // inflow_state()/prim_to_cons are __device__ functions; mirror their values
+    // on the host (see k_test_inflow_state expectations above).
+    const double infl_rho = 1.0;
+    const double infl_mx = cfg.inflow_mach * std::sqrt(cfg.gamma);
+
     CK(cudaMemcpy(U.rho, nrho, (size_t)N * sizeof(double), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(U.mx, nmx, (size_t)N * sizeof(double), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(U.my, nmy, (size_t)N * sizeof(double), cudaMemcpyHostToDevice));
@@ -605,9 +610,8 @@ int main(int argc, char **argv) {
     k_test_neighbors<<<1, 1>>>(U, dMaskN, d, x, y);
     CK(cudaDeviceSynchronize());
     CK(cudaMemcpy(h, d, 5 * sizeof(double), cudaMemcpyDeviceToHost));
-    Prim infl = inflow_state();
-    CHECK_NEAR(stats, h[0], infl.rho, 1e-12, "left boundary uses inflow rho");
-    CHECK_NEAR(stats, h[1], prim_to_cons(infl).mx, 1e-10,
+    CHECK_NEAR(stats, h[0], infl_rho, 1e-12, "left boundary uses inflow rho");
+    CHECK_NEAR(stats, h[1], infl_mx, 1e-10,
                "left boundary uses inflow momentum");
     CHECK_NEAR(stats, h[2], 1.0, 1e-12, "right neighbor uses cell rho");
     CHECK_NEAR(stats, h[3], 7.0, 1e-12, "right neighbor uses fluid state");
@@ -617,9 +621,9 @@ int main(int argc, char **argv) {
     k_test_neighbor_for_diff<<<1, 1>>>(U, dMaskN, d, x, y);
     CK(cudaDeviceSynchronize());
     CK(cudaMemcpy(h, d, 4 * sizeof(double), cudaMemcpyDeviceToHost));
-    CHECK_NEAR(stats, h[0], infl.rho, 1e-12,
+    CHECK_NEAR(stats, h[0], infl_rho, 1e-12,
                "neighbor_for_diff left boundary uses inflow rho");
-    CHECK_NEAR(stats, h[1], prim_to_cons(infl).mx, 1e-10,
+    CHECK_NEAR(stats, h[1], infl_mx, 1e-10,
                "neighbor_for_diff left boundary uses inflow mx");
     CHECK_NEAR(stats, h[2], -3.0, 1e-12,
                "neighbor_for_diff masked cell reflects momentum");
