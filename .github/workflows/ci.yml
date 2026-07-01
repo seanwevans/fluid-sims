@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  RAYLIB_VERSION: "5.5"
+
+jobs:
+  cpu:
+    name: Build CPU demos (gcc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install apt dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libncurses-dev \
+            libgl1-mesa-dev libx11-dev
+
+      # raylib is not packaged in Ubuntu's repos, so install the official
+      # prebuilt release into /usr/local.
+      - name: Install raylib
+        run: |
+          set -e
+          curl -fsSL -o raylib.tar.gz \
+            "https://github.com/raysan5/raylib/releases/download/${RAYLIB_VERSION}/raylib-${RAYLIB_VERSION}_linux_amd64.tar.gz"
+          mkdir raylib-pkg
+          tar -xzf raylib.tar.gz -C raylib-pkg --strip-components=1
+          sudo cp -r raylib-pkg/include/* /usr/local/include/
+          sudo cp -r raylib-pkg/lib/* /usr/local/lib/
+          sudo ldconfig
+
+      - name: Build
+        run: make cpu
+
+  cuda:
+    name: Build CUDA demos + tests (nvcc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Install only the compiler and runtime; the full meta-package would pull
+      # in the NVIDIA driver, which cannot build on a runner without a GPU.
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          method: network
+          sub-packages: '["nvcc", "cudart", "cudart-dev"]'
+
+      - name: Install apt dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libncurses-dev \
+            libgl1-mesa-dev libx11-dev
+
+      - name: Install raylib
+        run: |
+          set -e
+          curl -fsSL -o raylib.tar.gz \
+            "https://github.com/raysan5/raylib/releases/download/${RAYLIB_VERSION}/raylib-${RAYLIB_VERSION}_linux_amd64.tar.gz"
+          mkdir raylib-pkg
+          tar -xzf raylib.tar.gz -C raylib-pkg --strip-components=1
+          sudo cp -r raylib-pkg/include/* /usr/local/include/
+          sudo cp -r raylib-pkg/lib/* /usr/local/lib/
+          sudo ldconfig
+
+      # nvcc can compile and link the CUDA demos and the test harness without a
+      # GPU present; only running the test binary needs a device. Use the
+      # runner's default g++ as the host compiler.
+      - name: Build CUDA demos + tests
+        run: make cuda CCBIN=g++
+
+      - name: Run regression + unit tests (only if a GPU is available)
+        run: |
+          if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+            make test
+          else
+            echo "No CUDA-capable GPU on this runner; tests were compiled but not executed."
+          fi

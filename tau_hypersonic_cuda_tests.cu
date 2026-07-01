@@ -313,10 +313,11 @@ __global__ void k_test_hllc_consistency(double *out) {
   out[7] = Fy.E - Fy_ref.E;
 }
 
-int main(int argc, char **argv) {
-  RegressionOptions options{};
-  if (!parse_regression_options(argc, argv, &options))
-    return 2;
+__global__ void k_test_enforce_positive(double *out) {
+  Prim qc{1.0, 4.0, -2.0, 1.0};
+  Prim qm{-1.0, 8.0, -4.0, -3.0};
+  Prim qp{-2.0, -8.0, 4.0, -2.0};
+  enforce_positive_faces(qm, qc, qp);
 
   out[0] = qm.rho;
   out[1] = qm.p;
@@ -369,11 +370,12 @@ __global__ void k_test_neighbor_for_diff(Usoa U, const uint8_t *mask,
   out[3] = top_clamped.rho;
 }
 
-int main() {
-  TestStats stats{0, 0};
-  SimConfig cfg = default_config();
-  CK(cudaMemcpyToSymbol(d_cfg, &cfg, sizeof(SimConfig)));
+int main(int argc, char **argv) {
+  RegressionOptions options{};
+  if (!parse_regression_options(argc, argv, &options))
+    return 2;
 
+  TestStats stats{0, 0};
   SimConfig cfg = default_config();
   CK(cudaMemcpyToSymbol(d_cfg, &cfg, sizeof(SimConfig)));
 
@@ -455,6 +457,14 @@ int main() {
   alloc_Cs(&dYStateR, N);
   alloc_Cs(&dXFlux, (W + 1) * H);
   alloc_Cs(&dYFlux, W * (H + 1));
+  k_test_enforce_positive<<<1, 1>>>(d);
+  CK(cudaDeviceSynchronize());
+  CK(cudaMemcpy(h, d, 4 * sizeof(double), cudaMemcpyDeviceToHost));
+  CHECK_TRUE(stats, h[0] >= EPS_RHO, "enforce_positive_faces keeps qm rho > 0");
+  CHECK_TRUE(stats, h[1] >= EPS_P, "enforce_positive_faces keeps qm p > 0");
+  CHECK_TRUE(stats, h[2] >= EPS_RHO, "enforce_positive_faces keeps qp rho > 0");
+  CHECK_TRUE(stats, h[3] >= EPS_P, "enforce_positive_faces keeps qp p > 0");
+
   k_test_enforce_positive_no_change<<<1, 1>>>(d);
   CK(cudaDeviceSynchronize());
   CK(cudaMemcpy(h, d, 4 * sizeof(double), cudaMemcpyDeviceToHost));
@@ -551,35 +561,83 @@ int main() {
   free(hRho);
   free(hMx);
   free(hMy);
-  k_test_neighbors<<<1, 1>>>(U, dMask, d, x, y);
-  CK(cudaDeviceSynchronize());
-  CK(cudaMemcpy(h, d, 5 * sizeof(double), cudaMemcpyDeviceToHost));
-  Prim infl = inflow_state();
-  CHECK_NEAR(stats, h[0], infl.rho, 1e-12, "left boundary uses inflow rho");
-  CHECK_NEAR(stats, h[1], prim_to_cons(infl).mx, 1e-10,
-             "left boundary uses inflow momentum");
-  CHECK_NEAR(stats, h[2], 1.0, 1e-12, "right neighbor uses cell rho");
-  CHECK_NEAR(stats, h[3], 7.0, 1e-12, "right neighbor uses fluid state");
-  CHECK_NEAR(stats, h[4], -3.0, 1e-12,
-             "masked neighbor reflects no-slip momentum");
-
-  k_test_neighbor_for_diff<<<1, 1>>>(U, dMask, d, x, y);
-  CK(cudaDeviceSynchronize());
-  CK(cudaMemcpy(h, d, 4 * sizeof(double), cudaMemcpyDeviceToHost));
-  CHECK_NEAR(stats, h[0], infl.rho, 1e-12,
-             "neighbor_for_diff left boundary uses inflow rho");
-  CHECK_NEAR(stats, h[1], prim_to_cons(infl).mx, 1e-10,
-             "neighbor_for_diff left boundary uses inflow mx");
-  CHECK_NEAR(stats, h[2], -3.0, 1e-12,
-             "neighbor_for_diff masked cell reflects momentum");
-  CHECK_NEAR(stats, h[3], 1.0, 1e-12,
-             "neighbor_for_diff clamps y index before lookup");
-
-  free(hrho);
-  free(hmx);
-  free(hmy);
   free(hE);
   free(hMask);
+
+  // Neighbor lookups on a hand-crafted field: left column hits the inflow
+  // boundary, the right neighbor reads a fluid cell, and the cell above is a
+  // wall that should reflect momentum (no-slip).
+  {
+    Usoa U{};
+    alloc_Us(&U, N);
+    uint8_t *dMaskN = nullptr;
+    CK(cudaMalloc(&dMaskN, (size_t)N * sizeof(uint8_t)));
+
+    double *nrho = (double *)malloc((size_t)N * sizeof(double));
+    double *nmx = (double *)malloc((size_t)N * sizeof(double));
+    double *nmy = (double *)malloc((size_t)N * sizeof(double));
+    double *nE = (double *)malloc((size_t)N * sizeof(double));
+    uint8_t *nmask = (uint8_t *)malloc((size_t)N * sizeof(uint8_t));
+
+    for (int i = 0; i < N; i++) {
+      nrho[i] = 1.0;
+      nmx[i] = 0.0;
+      nmy[i] = 0.0;
+      nE[i] = 1.0 / (cfg.gamma - 1.0); // rest state (rho=1, u=v=0, p=1)
+      nmask[i] = 0;
+    }
+
+    int x = 0, y = 10;
+    int i_center = y * W + x;
+    int i_right = y * W + (x + 1);
+    int i_up = (y + 1) * W + x;
+
+    nmx[i_center] = 3.0;
+    nmx[i_right] = 7.0;
+    nmask[i_up] = 1;
+
+    // inflow_state()/prim_to_cons are __device__ functions; mirror their values
+    // on the host (see k_test_inflow_state expectations above).
+    const double infl_rho = 1.0;
+    const double infl_mx = cfg.inflow_mach * std::sqrt(cfg.gamma);
+
+    CK(cudaMemcpy(U.rho, nrho, (size_t)N * sizeof(double), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(U.mx, nmx, (size_t)N * sizeof(double), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(U.my, nmy, (size_t)N * sizeof(double), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(U.E, nE, (size_t)N * sizeof(double), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dMaskN, nmask, (size_t)N * sizeof(uint8_t), cudaMemcpyHostToDevice));
+
+    k_test_neighbors<<<1, 1>>>(U, dMaskN, d, x, y);
+    CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(h, d, 5 * sizeof(double), cudaMemcpyDeviceToHost));
+    CHECK_NEAR(stats, h[0], infl_rho, 1e-12, "left boundary uses inflow rho");
+    CHECK_NEAR(stats, h[1], infl_mx, 1e-10,
+               "left boundary uses inflow momentum");
+    CHECK_NEAR(stats, h[2], 1.0, 1e-12, "right neighbor uses cell rho");
+    CHECK_NEAR(stats, h[3], 7.0, 1e-12, "right neighbor uses fluid state");
+    CHECK_NEAR(stats, h[4], -3.0, 1e-12,
+               "masked neighbor reflects no-slip momentum");
+
+    k_test_neighbor_for_diff<<<1, 1>>>(U, dMaskN, d, x, y);
+    CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(h, d, 4 * sizeof(double), cudaMemcpyDeviceToHost));
+    CHECK_NEAR(stats, h[0], infl_rho, 1e-12,
+               "neighbor_for_diff left boundary uses inflow rho");
+    CHECK_NEAR(stats, h[1], infl_mx, 1e-10,
+               "neighbor_for_diff left boundary uses inflow mx");
+    CHECK_NEAR(stats, h[2], -3.0, 1e-12,
+               "neighbor_for_diff masked cell reflects momentum");
+    CHECK_NEAR(stats, h[3], 1.0, 1e-12,
+               "neighbor_for_diff clamps y index before lookup");
+
+    free(nrho);
+    free(nmx);
+    free(nmy);
+    free(nE);
+    free(nmask);
+    cudaFree(dMaskN);
+    free_Us(&U);
+  }
 
   cudaFree(dMaxSpeed);
   cudaFree(dBlockSpeedMax);
