@@ -79,7 +79,7 @@ tgs: tau_gray_scott.cu
 	$(NVCC) -std=c++17 -ccbin $(CCBIN) -O3 -use_fast_math -arch=sm_86 -lineinfo $< -lncursesw -o $@
 
 tau3d: tau_hypersonic_3d_cuda.cu
-	$(NVCC) -O3 -std=c++17 $< -o $@ -lineinfo
+	$(NVCC) -O3 -std=c++17 $< -o $@ -lineinfo -lraylib
 
 tau_2d_hypersonic_cuda: tau_hypersonic_cuda.cu
 	$(NVCC) -O3 -o $@ $< -std=c++17 -lraylib
