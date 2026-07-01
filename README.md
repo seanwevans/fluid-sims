@@ -29,6 +29,9 @@ Video: A CUDA-based 2-D fluid dynamics simulator
 https://github.com/user-attachments/assets/b7bbda96-7fec-4abb-9a80-bc461a0edaa6
 
 
+Video: CUDA D2Q9 Lattice Boltzmann Method simulator (build `tau_lbm`)
+
+Run with `nvcc -std=c++17 -O3 -use_fast_math -o tau_lbm tau_lbm.cu -lncursesw` and `./tau_lbm`.
 Video: Hybrid CUDA FLIP/APIC particle-grid incompressible fluid simulator (build `tau_flip_apic`)
 
 ```bash
