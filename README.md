@@ -17,6 +17,7 @@ This is intentionally a laboratory rather than a single CFD framework. Different
 The repository currently includes:
 
 * 2-D and 3-D hypersonic compressible-flow solvers
+* an axisymmetric Mach 25 re-entry capsule written without subtraction or zero
 * CPU, SIMD, and CUDA implementations of related flow problems
 * Smoothed Particle Hydrodynamics (SPH)
 * hybrid FLIP/APIC incompressible flow
@@ -28,7 +29,7 @@ The repository currently includes:
 * Gray–Scott reaction–diffusion
 * CUDA grid-fluid experiments
 * interactive and headless execution paths
-* regression testing for the CUDA hypersonic solver
+* regression testing for the CUDA hypersonic and re-entry solvers
 
 The goal is to compare representations.
 
@@ -81,6 +82,7 @@ https://github.com/user-attachments/assets/b7bbda96-7fec-4abb-9a80-bc461a0edaa6
 | [`tau_hypersonic.c`](tau_hypersonic.c)                   | 2-D compressible Euler, MUSCL reconstruction, MC limiting, HLLC flux | C / CPU        | raylib  |
 | [`tau_hypersonic_simd.c`](tau_hypersonic_simd.c)         | SIMD-oriented hypersonic-flow implementation                         | C / AVX2 + FMA | raylib  |
 | [`tau_hypersonic_cuda.cu`](tau_hypersonic_cuda.cu)       | large-grid 2-D hypersonic compressible flow                          | CUDA           | raylib  |
+| [`tau_reentry_cuda.cu`](tau_reentry_cuda.cu)             | axisymmetric Mach 25 re-entry capsule, subtraction-free arithmetic   | CUDA           | raylib  |
 | [`tau_hypersonic_3d_cuda.cu`](tau_hypersonic_3d_cuda.cu) | 3-D hypersonic flow                                                  | CUDA           | raylib  |
 | [`tau_sph.cu`](tau_sph.cu)                               | 2-D Smoothed Particle Hydrodynamics                                  | CUDA           | ncurses |
 | [`tau_flip_apic.cu`](tau_flip_apic.cu)                   | hybrid FLIP/APIC incompressible flow                                 | CUDA           | ncurses |
@@ -126,6 +128,51 @@ The CUDA branch explores the same general problem at much larger grid sizes and 
 * pressure/density structure
 
 The point of keeping CPU, SIMD, 2-D CUDA, and 3-D CUDA versions beside one another is that the governing physics can remain recognizable while the computational representation changes substantially.
+
+---
+
+## Mach 25 re-entry, in an arithmetic without subtraction
+
+[`tau_reentry_cuda.cu`](tau_reentry_cuda.cu) is the most explicit representation experiment in the repository. It sits beside the hypersonic family rather than replacing any of it, and it changes two things at once: the problem it targets and the arithmetic it is written in.
+
+### The physics
+
+It solves the **axisymmetric** compressible Euler equations around an **Apollo-class re-entry capsule at Mach 25**, blunt heat shield forward:
+
+* spherical-segment heat shield with a radius of curvature of 1.2 base diameters, a filleted shoulder, a 33° conical afterbody, and a truncated aft deck
+* a geometric source term for the axisymmetric equations, with a symmetry condition on the axis; the planar equations give the wrong shock stand-off for a body of revolution
+* an effective ratio of specific heats of 1.2, parameterized as a polytropic index; air behind a Mach 25 normal shock dissociates, and the equilibrium effective gamma is what sets the stand-off distance
+* MUSCL reconstruction with monotonized-central limiting, dropping to first order beside the body and wherever a reconstructed face would leave the physical state space
+* HLLC interface fluxes with Quirk's shock fix: cells beside a compressive pressure jump are flagged and every face touching one falls back to HLLE. Flagging per cell rather than per face is the point, since the faces lying *along* a grid-aligned bow shock see almost no normal jump of their own; without the transverse half of the cure the bow shock breathes and eventually carbuncles
+* an exact slip wall: only the face-normal velocity component is reflected in the solid ghost cells
+* SSP-RK2 in time, and no artificial hyperviscosity anywhere
+
+Views: log density, log pressure, speed, schlieren, Mach number, temperature, and vorticity, drawn as a half plane mirrored about the axis.
+
+On a 128 x 64 host run of the same cell bodies the bow shock stands off 0.105 nose radii and the wall pressure on the axis reaches 96% of the Rayleigh pitot value for this gas and Mach number.
+
+### The arithmetic
+
+Every floating-point quantity in the solver is a strictly positive `double` `t` standing for the real value `TAU_SCALE * log(t)`. The multiplicative group of the positive reals then carries the additive structure of the reals:
+
+| in the value | in the code |
+| ------------ | ----------- |
+| `a + b`      | `a * b`     |
+| `a - b`      | `a / b`     |
+| `0`          | `1.0`       |
+| `-a`         | `1.0 / a`   |
+| `a / 2`      | `sqrt(a)`   |
+| `a * 2`      | `a * a`     |
+| `a * c`      | `pow(a, c)` |
+| `a < b`      | `a < b`     |
+
+Products and quotients of two values ride the same isomorphism through `log` and `exp`; comparison, `min`, `max`, magnitude, and negation are exact and free.
+
+The consequence is that **the source contains no subtraction operator and no literal zero**. There is no binary `-`, no unary `-`, no `-=`, no `--`, and no `0`: small constants are written as reciprocals such as `1.0 / 1e8`, hyphens appear only in comments and in command-line option strings, and the one integer zero the raylib draw origin needs is derived as `1 / 2` rather than written down.
+
+Consequences worth knowing: the encoding has *uniform absolute* precision of about `TAU_SCALE * 2^-53`, roughly `1e-13` in value units, across the whole dynamic range of a re-entry flow, and its representable range is about `±7.1e5`. Global sums must therefore be taken as means, which is what the diagnostics do.
+
+Its kernels are thin wrappers around host-callable cell bodies, and `NX`/`NY` can be overridden at build time, so the whole solver can also be driven on the CPU at a coarse grid without a GPU.
 
 ---
 
@@ -430,6 +477,8 @@ tgs
 tau3d
 tau_2d_hypersonic_cuda
 tau_hypersonic_cuda_tests
+tau_reentry
+tau_reentry_cuda_tests
 tau_sw
 tau_sph
 ```
@@ -499,12 +548,13 @@ nvcc \
 
 # Testing
 
-The CUDA hypersonic implementation has both unit/regression machinery and a reproducible snapshot format.
+The CUDA hypersonic and re-entry implementations both have unit/regression machinery and a reproducible snapshot format.
 
-Build the test executable with:
+Build the test executables with:
 
 ```bash
 make tau_hypersonic_cuda_tests
+make tau_reentry_cuda_tests
 ```
 
 Run the standard regression round trip:
@@ -513,10 +563,18 @@ Run the standard regression round trip:
 make test
 ```
 
-The Makefile performs two runs:
+For each solver the Makefile performs two runs:
 
 1. generate a fresh baseline,
 2. rerun the simulation and verify against that baseline.
+
+`tau_reentry_cuda_tests` adds three layers:
+
+* **host tests**, which need no GPU: the tau algebra checked against ordinary arithmetic as an independent oracle, thermodynamic round trips, flux consistency, Rankine-Hugoniot jump conditions at Mach 25, the slip-wall flux, the shock flag in both directions, the capsule geometry, and a 1-D driver that runs the solver's own reconstruction, Riemann solver, and multiplicative update over a shock tube and a standing Mach 25 shock;
+* **device tests**, which check the carving, boundary, and stepping kernels, including that a uniform free stream is an exact fixed point of the axisymmetric update;
+* the **regression baseline** round trip.
+
+When no CUDA device is present its host tests still run and the rest are skipped. Passing `--host-2d N` additionally drives the full 2-D solver on the CPU for `N` steps, which is practical when the binary is built with a coarse grid, for example `-DNX=192 -DNY=96`.
 
 The regression snapshot records quantities including:
 

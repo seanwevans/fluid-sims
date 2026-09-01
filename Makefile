@@ -23,7 +23,8 @@ CPU_BINS  := number_fluid2d number_fluid3d sim tau_hypersonic \
              tau_hypersonic_simd tau_mhd
 
 CUDA_BINS := jsc jsc3d tau_burgers tgs tau3d tau_2d_hypersonic_cuda \
-             tau_hypersonic_cuda_tests tau_sw tau_sph
+             tau_hypersonic_cuda_tests tau_reentry tau_reentry_cuda_tests \
+             tau_sw tau_sph
 
 # th3cs also needs 4splat.c, so it is kept out of the default group and built
 # explicitly with `make th3cs`.
@@ -37,10 +38,13 @@ cuda: $(CUDA_BINS)
 # Requires a CUDA-capable GPU at runtime; writes a fresh baseline and then
 # verifies the same run against it (round-trip self-check).
 BASELINE ?= tau_hypersonic_cuda_baseline.txt
+REENTRY_BASELINE ?= tau_reentry_cuda_baseline.txt
 TEST_STEPS ?= 24
-test: tau_hypersonic_cuda_tests
+test: tau_hypersonic_cuda_tests tau_reentry_cuda_tests
 	./tau_hypersonic_cuda_tests --steps $(TEST_STEPS) --write-baseline  --baseline $(BASELINE)
 	./tau_hypersonic_cuda_tests --steps $(TEST_STEPS) --verify-baseline --baseline $(BASELINE)
+	./tau_reentry_cuda_tests --steps $(TEST_STEPS) --write-baseline  --baseline $(REENTRY_BASELINE)
+	./tau_reentry_cuda_tests --steps $(TEST_STEPS) --verify-baseline --baseline $(REENTRY_BASELINE)
 
 # ---------------------------------------------------------------------------
 # CPU targets (gcc)
@@ -87,6 +91,12 @@ tau_2d_hypersonic_cuda: tau_hypersonic_cuda.cu
 tau_hypersonic_cuda_tests: tau_hypersonic_cuda_tests.cu
 	$(NVCC) -O2 -std=c++17 -o $@ $<
 
+tau_reentry: tau_reentry_cuda.cu
+	$(NVCC) -O3 -o $@ $< -std=c++17 -lraylib
+
+tau_reentry_cuda_tests: tau_reentry_cuda_tests.cu
+	$(NVCC) -O2 -std=c++17 -o $@ $<
+
 tau_sw: tau_shallow_water.cu
 	$(NVCC) -std=c++17 -O3 -use_fast_math -arch=sm_86 -lineinfo -o $@ $< -lncursesw
 
@@ -98,4 +108,4 @@ th3cs: th3cs.cu 4splat.c
 
 # ---------------------------------------------------------------------------
 clean:
-	$(RM) $(CPU_BINS) $(CUDA_BINS) th3cs $(BASELINE)
+	$(RM) $(CPU_BINS) $(CUDA_BINS) th3cs $(BASELINE) $(REENTRY_BASELINE)
